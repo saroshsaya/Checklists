@@ -2,7 +2,6 @@ import hmac
 import html
 import re
 import uuid
-import pandas as pd
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
@@ -318,74 +317,6 @@ def update_exception(exc_id, fby, fdate, status):
     resolved_on = now_ist().date().isoformat() if status == "Resolved" else ""
     ws.batch_update([{"range": f"G{r}:J{r}", "values": [[fby, fdate, status, resolved_on]]}],
                     value_input_option="RAW")
-
-
-# ─── One-time import of exceptions from the older sheets ──────────────────────
-TAB_RE = re.compile(r"^(Day Start|Day End)\((\d{2})-(\d{2})(?:-(\d{4}))?\)")
-NOISE  = {"", "none", "n/a", "na", "nil", "-", "no"}
-
-def extract_exceptions(title, vals):
-    """Pull the 'Issue / Exception | Action Taken | Escalated To ...' table rows out of one tab."""
-    m = TAB_RE.match(title.strip())
-    if not m:
-        return []
-    source, dd, mm, yyyy = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4) or 2026)
-    try:
-        day = date(yyyy, mm, dd).isoformat()
-    except ValueError:
-        return []
-    out = []
-    for i, r in enumerate(vals):
-        r = (list(r) + [""] * 6)[:6]
-        if r[0].strip() == "Issue / Exception" and r[1].strip() == "Action Taken":
-            for row in vals[i + 1:]:
-                row = [str(c).strip() for c in (list(row) + [""] * 6)[:6]]
-                if not any(row) or row[0].startswith("Completed by"):
-                    break
-                issue, action, esc, fby = row[0], row[1], row[2], row[3]
-                if issue.lower() in NOISE and not action and not esc:
-                    continue
-                out.append({"date": day, "source": source, "issue": issue,
-                            "action": action, "escalated": esc, "fby": fby})
-    return out
-
-def scan_old_exceptions():
-    """Reads every Day Start/Day End tab in ONE request and returns new (not yet logged) exceptions."""
-    sh = get_spreadsheet()
-    titles = [w.title for w in sh.worksheets() if TAB_RE.match(w.title.strip())]
-    found = []
-    if titles:
-        res = sh.values_batch_get([f"'{t}'!A1:F80" for t in titles])
-        for t, vr in zip(titles, res.get("valueRanges", [])):
-            found += extract_exceptions(t, vr.get("values", []))
-    have = {(e["date"], e["source"], e["issue"].strip().lower()) for e in load_exceptions()}
-    rows, seen = [], set()
-    for e in sorted(found, key=lambda e: (e["date"], e["source"])):
-        key = (e["date"], e["source"], e["issue"].strip().lower())
-        if key in have or key in seen:
-            continue
-        seen.add(key)
-        rows.append({"Import": True, "Still open": False, "Date": e["date"], "Source": e["source"],
-                     "Issue": e["issue"], "Action taken": e["action"],
-                     "Escalated to": e["escalated"], "Follow-up by": e["fby"]})
-    return pd.DataFrame(rows, columns=["Import", "Still open", "Date", "Source", "Issue",
-                                       "Action taken", "Escalated to", "Follow-up by"])
-
-def import_exceptions(df):
-    ws = get_log_ws(get_spreadsheet())
-    old = ws.get_all_values()
-    body = [(r + [""] * 10)[:10] for r in old[1:] if any(r)]
-    new = []
-    for _, r in df[df["Import"]].iterrows():
-        resolved = not bool(r["Still open"])
-        new.append([uuid.uuid4().hex[:8], r["Date"], r["Source"], r["Issue"], r["Action taken"],
-                    r["Escalated to"], r["Follow-up by"], "",
-                    "Resolved" if resolved else "Open", r["Date"] if resolved else ""])
-    final = [EXC_HEADER] + body + new
-    if len(final) + 5 > ws.row_count:
-        ws.resize(rows=len(final) + 200)
-    ws.batch_update([{"range": "A1", "values": final}], value_input_option="RAW")
-    return len(new)
 
 
 # ─── Save entry points ────────────────────────────────────────────────────────
@@ -734,34 +665,6 @@ with tab_ex:
                         st.rerun()
                     except Exception as ex:
                         st.error(f"Could not save. {explain(ex)}")
-
-        with st.expander("Import exceptions from older sheets (one-time)"):
-            st.caption("Reads the exceptions from your existing Day Start / Day End tabs. Review the list: "
-                       "untick **Import** for anything that isn't a real exception, tick **Still open** for "
-                       "anything not yet resolved, and fix any wording. Imported items are marked Resolved "
-                       "unless you tick Still open. Ones already in the log are skipped.")
-            if st.button("Scan old sheets", key="imp_scan"):
-                try:
-                    st.session_state["imp_df"] = scan_old_exceptions()
-                except Exception as ex:
-                    st.error(f"Could not scan. {explain(ex)}")
-            imp = st.session_state.get("imp_df")
-            if imp is not None:
-                if imp.empty:
-                    st.success("Nothing new to import.")
-                else:
-                    edited = st.data_editor(imp, hide_index=True, key="imp_editor",
-                                            disabled=["Date", "Source"], num_rows="fixed")
-                    n = int(edited["Import"].sum())
-                    if st.button(f"Import {n} exception(s)", key="imp_go", disabled=n == 0):
-                        try:
-                            done_n = import_exceptions(edited)
-                            st.session_state.pop("imp_df", None)
-                            clear_caches()
-                            st.toast(f"Imported {done_n}")
-                            st.rerun()
-                        except Exception as ex:
-                            st.error(f"Could not import. {explain(ex)}")
 
         if show_resolved:
             done = [e for e in allx if e["status"] == "Resolved"]
