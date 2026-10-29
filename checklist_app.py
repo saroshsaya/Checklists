@@ -28,6 +28,14 @@ BLUE, DARK, RED, OKGREEN   = "#6FA8DC", "#2B2B2B", "#E53935", "#43A047"
 STATUS_COLOUR = {"Open": RED, "In Progress": ORANGE, "Resolved": OKGREEN}
 
 
+def tab_name(kind, d):
+    return f"{kind}({d:%d-%m-%Y})"
+
+def legacy_name(kind, d):
+    """Old tabs (imported from the Excel file) had no year; they are all from 2026."""
+    return f"{kind}({d:%d-%m})" if d.year == 2026 else None
+
+
 def now_ist():
     return datetime.now(IST)
 
@@ -214,7 +222,7 @@ def format_tab(sh, ws, rows):
             "properties": {"pixelSize": px}, "fields": "pixelSize"}})
     sh.batch_update({"requests": reqs})
 
-def write_tab(name, rows):
+def write_tab(name, rows, legacy=None):
     sh = get_spreadsheet()
     width = max(6, max(len(r) for r in rows))
     try:
@@ -228,6 +236,11 @@ def write_tab(name, rows):
         format_tab(sh, ws, rows)
     except Exception:
         pass                                     # formatting is cosmetic; never fail a save over it
+    if legacy and legacy != name:                # replaced an old year-less tab -> drop it
+        try:
+            sh.del_worksheet(sh.worksheet(legacy))
+        except gspread.WorksheetNotFound:
+            pass
 
 
 # ─── Exceptions Log (permanent sheet) ─────────────────────────────────────────
@@ -287,7 +300,7 @@ def update_exception(exc_id, fby, fdate, status):
 # ─── Save entry points ────────────────────────────────────────────────────────
 def save_day_start(h, vals, exceptions):
     d = h["date"]
-    name = f"Day Start({d:%d-%m})"
+    name = tab_name("Day Start", d)
     rows = [
         ["WAREHOUSE — DAY START CHECKLIST"],
         ["Complete after arrival (approx 10:00). Critical items are highlighted. "
@@ -299,13 +312,13 @@ def save_day_start(h, vals, exceptions):
     rows += sections_to_rows(DS_SECTIONS, vals)
     rows += exceptions_to_rows("EXCEPTIONS / ISSUES LOG", exceptions)
     rows.append(["Completed by (signature/name)", h["by"], "", "Supervisor verification"])
-    write_tab(name, rows)
+    write_tab(name, rows, legacy_name("Day Start", d))
     n = sync_exceptions(d.isoformat(), "Day Start", exceptions)
     return name, n
 
 def save_day_end(h, vals, exceptions):
     d = h["date"]
-    name = f"Day End({d:%d-%m})"
+    name = tab_name("Day End", d)
     rows = [
         ["WAREHOUSE — DAY END CHECKLIST"],
         ["TO BE COMPLETED BY CLOSING SUPERVISOR / SENIOR EXEC (target ~7:00 PM). "
@@ -317,7 +330,7 @@ def save_day_end(h, vals, exceptions):
     rows += sections_to_rows(DE_SECTIONS, vals)
     rows += exceptions_to_rows("EXCEPTIONS / ISSUES LOG (Hand-over for next day)", exceptions)
     rows.append(["Completed by (Closing Supervisor)", h["by"], "", "Next-day review by", "", h["review"]])
-    write_tab(name, rows)
+    write_tab(name, rows, legacy_name("Day End", d))
     n = sync_exceptions(d.isoformat(), "Day End", exceptions)
     return name, n
 
@@ -325,7 +338,8 @@ def save_day_end(h, vals, exceptions):
 # ─── Styling ──────────────────────────────────────────────────────────────────
 CSS = f"""
 <style>
-.stApp {{ background:#fff; }}
+.stApp {{ background:#fff; color:#111; }}
+[data-testid="stWidgetLabel"] p, [data-testid="stCaptionContainer"] {{ color:#222 !important; }}
 header[data-testid="stHeader"] {{ background:transparent; }}
 .block-container {{ padding-top:1.2rem; max-width:1150px; }}
 div[data-testid="stVerticalBlock"] {{ gap:.45rem; }}
@@ -336,21 +350,21 @@ div[data-testid="stVerticalBlock"] {{ gap:.45rem; }}
 .banner .pill {{ display:inline-block; background:{DARK}; color:#fff; font-size:.8rem; font-weight:700;
                  padding:3px 12px; border-radius:4px; margin-top:10px; }}
 
-.stTabs [data-baseweb="tab-list"] {{ gap:3px; }}
-.stTabs [data-baseweb="tab"] {{ height:auto; padding:10px 22px; border-radius:0; font-weight:700;
-                                background:{AMBER}; color:#3b2a00; }}
-.stTabs [data-baseweb="tab"]:nth-child(3) {{ background:{BLUE}; color:#fff; }}
-.stTabs [data-baseweb="tab"]:nth-child(4) {{ background:#5CCB5F; color:#fff; }}
-.stTabs [data-baseweb="tab"][aria-selected="true"] {{ background:{ORANGE}; color:#fff;
-                                box-shadow:0 3px 7px rgba(0,0,0,.35); }}
-.stTabs [data-baseweb="tab"] p {{ color:inherit; font-weight:700; }}
+.stTabs [role="tablist"] {{ gap:3px; }}
+.stTabs [role="tab"] {{ height:auto; padding:10px 22px; border-radius:0; font-weight:700; border:0;
+                        background:{AMBER} !important; color:#3b2a00 !important; opacity:1 !important; }}
+.stTabs [role="tab"]:nth-child(3) {{ background:{BLUE} !important; color:#fff !important; }}
+.stTabs [role="tab"]:nth-child(4) {{ background:#5CCB5F !important; color:#fff !important; }}
+.stTabs [role="tab"][aria-selected="true"] {{ background:{ORANGE} !important; color:#fff !important;
+                        box-shadow:0 3px 7px rgba(0,0,0,.35); }}
+.stTabs [role="tab"] p, .stTabs [role="tab"] div {{ color:inherit !important; font-weight:700; opacity:1 !important; }}
 .stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] {{ display:none; }}
 
 div.stButton > button {{ background:{DARK}; color:#fff; border:0; border-radius:4px; font-weight:700; }}
 div.stButton > button:hover {{ background:#000; color:#fff; }}
 div.stButton > button p {{ color:#fff; }}
 
-.sec {{ background:{AMBER}; color:#3b2a00; font-weight:800; padding:7px 12px; margin:18px 0 4px;
+.sec {{ background:{AMBER}; color:#3b2a00; font-weight:800; padding:7px 12px; margin:18px 0 10px;
         border-radius:3px; letter-spacing:.2px; }}
 .colh {{ font-size:.7rem; color:#6b7280; font-weight:700; letter-spacing:.6px; }}
 .lbl {{ font-weight:500; color:#111; }}
@@ -358,7 +372,7 @@ div.stButton > button p {{ color:#fff; }}
 .crit {{ background:{RED}; color:#fff; font-size:.6rem; font-weight:800; padding:1px 6px;
          border-radius:3px; margin-left:6px; vertical-align:middle; }}
 
-.exc {{ border-left:6px solid #999; padding:4px 10px 6px; }}
+.exc {{ border-left:6px solid #999; padding:4px 10px 6px; margin-bottom:10px; }}
 .exc .chip {{ color:#fff; font-size:.7rem; font-weight:800; padding:2px 9px; border-radius:3px; margin-right:6px; }}
 .exc .meta {{ font-weight:700; color:#111; }}
 .exc div.l {{ margin-top:3px; color:#222; }}
@@ -368,7 +382,7 @@ div.stButton > button p {{ color:#fff; }}
 .vt table {{ width:100%; border-collapse:collapse; font-size:.86rem; }}
 .vt td {{ border-bottom:1px solid #eee; padding:3px 6px; vertical-align:top; color:#111; }}
 .vt tr.h td {{ background:#EBEBEB; font-weight:700; }}
-.vt td.crit {{ color:{RED}; font-weight:800; }}
+.vt td.critc {{ color:{RED}; font-weight:800; }}
 .vt .note {{ color:#444; font-size:.85rem; margin:3px 0; }}
 </style>
 """
@@ -380,9 +394,6 @@ def render_sections(prefix, sections):
     out = {}
     for title, items in sections:
         st.markdown(f'<div class="sec">{html.escape(title)}</div>', unsafe_allow_html=True)
-        h = st.columns([4, 2, 4])
-        for c, t in zip(h, ["CHECK", "ENTRY", "NOTES (OPTIONAL)"]):
-            c.markdown(f'<div class="colh">{t}</div>', unsafe_allow_html=True)
         for it in items:
             c1, c2, c3 = st.columns([4, 2, 4], vertical_alignment="center")
             lab = html.escape(it["label"])
@@ -436,15 +447,16 @@ def exceptions_input(prefix):
         st.rerun()
     return out
 
-def submit_gate(prefix, label, name):
+def submit_gate(prefix, label, name, legacy=None):
     """Renders the submit button; True only when it's OK to write (handles overwrite confirm)."""
-    if name in existing_tabs():
+    names = [name] + ([legacy] if legacy else [])
+    if any(n in existing_tabs() for n in names):
         st.warning(f"⚠️ **{name}** already exists. Submitting will **replace it completely**, "
                    "including the exceptions logged from it.")
     if not st.button(f"✅  Submit {label} Checklist", type="primary",
                      use_container_width=True, key=f"{prefix}_submit"):
         return False
-    if tab_exists_fresh(name) and st.session_state.get(f"{prefix}_armed") != name:
+    if any(tab_exists_fresh(n) for n in names) and st.session_state.get(f"{prefix}_armed") != name:
         st.session_state[f"{prefix}_armed"] = name
         st.error(f"An entry for **{name}** already exists. Click Submit again to overwrite it.")
         return False
@@ -487,8 +499,11 @@ def tab_html(vals):
             out.append(f'<div class="note">{html.escape(first)}</div>')
         else:
             head = first in ("Check / Field", "Issue / Exception")
+            r = list(r)
+            while r and not r[-1].strip():
+                r.pop()
             cells = "".join(
-                f'<td class="{"crit" if c == "CRITICAL" else ""}">{html.escape(c)}</td>' for c in r)
+                f'<td class="{"critc" if c == "CRITICAL" else ""}">{html.escape(c)}</td>' for c in r)
             table.append(f'<tr class="{"h" if head else ""}">{cells}</tr>')
     flush()
     out.append("</div>")
@@ -500,7 +515,7 @@ st.set_page_config(page_title="SayaCare Checklist", layout="wide", page_icon="�
 st.markdown(CSS, unsafe_allow_html=True)
 st.markdown(
     '<div class="banner"><div class="bt">Warehouse Checklist</div>'
-    '<div class="bs">SayaCare Operations</div><span class="pill">Location: Noida</span></div>',
+    '<div class="bs">SayaCare Operations</div></div>',
     unsafe_allow_html=True)
 
 # Optional password gate: add  app_password = "..."  to the Streamlit secrets to switch it on.
@@ -532,8 +547,8 @@ with tab_ds:
     ds_exc  = exceptions_input("ds")
     st.divider()
 
-    ds_name = f"Day Start({ds_date:%d-%m})"
-    if submit_gate("ds", "Day Start", ds_name):
+    ds_name = tab_name("Day Start", ds_date)
+    if submit_gate("ds", "Day Start", ds_name, legacy_name("Day Start", ds_date)):
         try:
             header = {"date": ds_date, "time": now_ist().strftime("%H:%M"),
                       "by": ds_by, "supervisor": ds_sup, "status": ds_status}
@@ -556,8 +571,8 @@ with tab_de:
     de_exc  = exceptions_input("de")
     st.divider()
 
-    de_name = f"Day End({de_date:%d-%m})"
-    if submit_gate("de", "Day End", de_name):
+    de_name = tab_name("Day End", de_date)
+    if submit_gate("de", "Day End", de_name, legacy_name("Day End", de_date)):
         try:
             header = {"date": de_date, "time": now_ist().strftime("%H:%M"), "by": de_by,
                       "review": "" if de_review == "—" else de_review, "status": de_status}
@@ -641,13 +656,17 @@ with tab_ex:
 with tab_view:
     vd = st.date_input("Date to view", value=now_ist().date(), key="view_date", format="DD/MM/YYYY")
     try:
-        ds_v = load_tab(f"Day Start({vd:%d-%m})")
-        de_v = load_tab(f"Day End({vd:%d-%m})")
+        ds_v = load_tab(tab_name("Day Start", vd))
+        de_v = load_tab(tab_name("Day End", vd))
+        if ds_v is None and legacy_name("Day Start", vd):
+            ds_v = load_tab(legacy_name("Day Start", vd))
+        if de_v is None and legacy_name("Day End", vd):
+            de_v = load_tab(legacy_name("Day End", vd))
     except Exception as ex:
         ds_v = de_v = None
         st.error(f"Could not load: {ex}")
     if ds_v is None and de_v is None:
-        st.info(f"No Day Start or Day End entry found for {vd:%d-%m}.")
+        st.info(f"No Day Start or Day End entry found for {vd:%d/%m/%Y}.")
     else:
         L, R = st.columns(2)
         with L:
