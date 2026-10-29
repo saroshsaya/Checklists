@@ -1,573 +1,662 @@
-import streamlit as st
+import hmac
+import html
+import re
+import uuid
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
+
 import gspread
+import streamlit as st
 from google.oauth2.service_account import Credentials
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-SHEET_ID   = "1jzQpd3MpCp0kT1djnJo_WfQMsbe-reK1oGtvgn6vE1Q"
+SHEET_ID    = "1jzQpd3MpCp0kT1djnJo_WfQMsbe-reK1oGtvgn6vE1Q"
 SUPERVISORS = ["Ashutosh Singh", "Anas", "Sarosh"]
 SCOPES      = ["https://www.googleapis.com/auth/spreadsheets"]
+IST         = ZoneInfo("Asia/Kolkata")          # servers run in UTC; we want Noida time
 
-# ─── Google Sheets connection ─────────────────────────────────────────────────
+EXC_TAB     = "Exceptions Log"
+EXC_HEADER  = ["ID", "Date", "Source", "Issue", "Action Taken", "Escalated To",
+               "Follow-up By", "Follow-up Date", "Status", "Resolved On"]
+EXC_KEYS    = ["id", "date", "source", "issue", "action", "escalated",
+               "fby", "fdate", "status", "resolved_on"]
+STATUSES    = ["Open", "In Progress", "Resolved"]
 
+# Samasya portal colours
+GREEN, NAVY, AMBER, ORANGE = "#00CC66", "#0A0A7A", "#F0C24B", "#FF9800"
+BLUE, DARK, RED, OKGREEN   = "#6FA8DC", "#2B2B2B", "#E53935", "#43A047"
+STATUS_COLOUR = {"Open": RED, "In Progress": ORANGE, "Resolved": OKGREEN}
+
+
+def now_ist():
+    return datetime.now(IST)
+
+
+# ─── Checklist definitions (single source of truth for UI + sheet output) ─────
+def I(label, key, kind="yn", crit=False, ph=""):
+    return {"label": label, "key": key, "kind": kind, "crit": crit, "ph": ph}
+
+DS_SECTIONS = [
+    ("1. ENVIRONMENT & WAREHOUSE READINESS", [
+        I("AC / climate control working",             "ac"),
+        I("Temperature (°C)",                         "temp",       "text", ph="e.g. 24"),
+        I("Humidity (%)",                             "humidity",   "text", ph="e.g. 45"),
+        I("Humidifier / dehumidifier status",         "humidifier", "text", ph="Working / Stopped"),
+        I("Pest / insect / rodent activity observed", "pest"),
+        I("Aisles / walking paths clear",             "aisles"),
+        I("Shelves / work areas tidy",                "shelves"),
+        I("Packing tables clean",                     "packing_tables"),
+    ]),
+    ("2. STOCK & STORAGE READINESS", [
+        I("Stock left in temporary / unusual locations",        "unusual"),
+        I("Stock on floor that should be shelved",              "floor"),
+        I("LT → ST movement still required?",                   "lt_st", crit=True),
+        I("Cubicles still needing movement (e.g. A3, B1, C7)",  "cubicles", "text", True, "A3, B1 / count"),
+        I("Damaged / open stock requiring attention",           "damaged", crit=True),
+        I("Stock discrepancy carried over from previous day",   "discrepancy", "text", ph="None / describe"),
+    ]),
+    ("3. SAMASYA / OPERATIONAL QUEUE (at time of check)", [
+        I("Orders still in ASSEMBLING", "assembling",    "num", True),
+        I("Orders still in PACKING",    "packing",       "num", True),
+        I("RTO queue requiring action", "rto",           "num"),
+        I("DTO queue requiring action", "dto",           "num"),
+        I("Notes pending",              "notes_pending", "num"),
+    ]),
+    ("4. EQUIPMENT & PACKING READINESS", [
+        I("Tablets working",                             "tablets",  crit=True),
+        I("Scanner working",                             "scanner",  crit=True),
+        I("Printers working",                            "printers", crit=True),
+        I("Weighing scales working",                     "scales",   crit=True),
+        I("Thermal rolls available",                     "thermal"),
+        I("Boxes available",                             "boxes",    crit=True),
+        I("Pouches available",                           "pouches",  crit=True),
+        I("Bubble wrap / protective material available", "bubble_wrap", crit=True),
+        I("Tape available",                              "tape"),
+        I("Packing station ready",                       "packing_station"),
+        I("Any equipment issue / note",                  "eq_issue", "text", True, "None / describe"),
+        I("Cameras working",                             "cameras"),
+    ]),
+]
+
+DE_SECTIONS = [
+    ("1. ORDER CLOSURE / WORKLOAD CARRIED FORWARD  ★ CRITICAL", [
+        I("Orders remaining in ASSEMBLING",         "assembling", "num", True),
+        I("Orders remaining in PACKING",            "packing",    "num", True),
+        I("Orders remaining in READY FOR SHIPPING", "rfs",        "text", True, "None / count"),
+        I("Issue / Exception (order ID)",           "issue",      "text", True, "Order ID or None"),
+        I("Courier handovers completed / recorded", "courier"),
+    ]),
+    ("2. MOVE LIST / CHECKING", [
+        I("Move List reviewed",                      "move_list"),
+        I("Cubicles still pending LT → ST",          "cubicles", "text", True, "A3, B1 / count"),
+        I("Checking reviewed",                       "checking"),
+        I("Outstanding discrepancies",               "discrepancies", "text", ph="None / describe"),
+    ]),
+    ("3. RTO / DTO", [
+        I("RTOs processed today",                "rto_processed"),
+        I("Unresolved RTO discrepancies",        "rto_disc", "text", ph="0 / count"),
+        I("DTOs processed today",                "dto_processed"),
+        I("Unresolved DTO discrepancies",        "dto_disc", "text", ph="0 / count"),
+        I("Returned stock requiring restocking", "restocking"),
+    ]),
+    ("4. WAREHOUSE RESET  ★ CRITICAL (Close Clean)", [
+        I("Loose stock returned to appropriate location", "loose_stock",       crit=True),
+        I("LT → ST movement completed",                   "lt_st",             crit=True),
+        I("Packing materials replenished",                "packing_materials", crit=True),
+        I("Picking / assembly area reset",                "assembly_reset",    crit=True),
+        I("Packing tables cleared",                       "packing_tables",    crit=True),
+        I("Aisles clear",                                 "aisles",            crit=True),
+    ]),
+    ("5. EQUIPMENT", [
+        I("Tablets kept on charge",           "tablets"),
+        I("Scanners kept on charge / stored", "scanner"),
+        I("Printers left ready for next day", "printers"),
+        I("Weighing scales left ready",       "scales"),
+        I("Camera working",                   "cameras"),
+    ]),
+    ("6. ENVIRONMENT", [
+        I("Final temperature (°C)",                      "temp",       "text", ph="e.g. 24"),
+        I("Final humidity (%)",                          "humidity",   "text", ph="e.g. 45"),
+        I("AC / climate control set for overnight",      "ac"),
+        I("Humidifier / dehumidifier set appropriately", "humidifier"),
+        I("Final pest / insect / rodent observation",    "pest", "text", ph="None / describe"),
+    ]),
+]
+
+
+# ─── Google Sheets plumbing ───────────────────────────────────────────────────
 @st.cache_resource
 def get_client():
     creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=SCOPES,
-    )
+        dict(st.secrets["gcp_service_account"]), scopes=SCOPES)
     return gspread.authorize(creds)
 
 def get_spreadsheet():
     return get_client().open_by_key(SHEET_ID)
 
-def _ws(sh, name):
-    """Delete tab with this name if it exists, then create a fresh one."""
+def tab_exists_fresh(name):
+    return name in [w.title for w in get_spreadsheet().worksheets()]
+
+@st.cache_data(ttl=20, show_spinner=False)
+def existing_tabs():
     try:
-        sh.del_worksheet(sh.worksheet(name))
+        return [w.title for w in get_spreadsheet().worksheets()]
+    except Exception:
+        return []
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_tab(name):
+    try:
+        return get_spreadsheet().worksheet(name).get_all_values()
     except gspread.WorksheetNotFound:
-        pass
-    return sh.add_worksheet(title=name, rows=120, cols=6)
+        return None
 
-# ─── Row-builder helpers ──────────────────────────────────────────────────────
+def clear_caches():
+    existing_tabs.clear()
+    load_tab.clear()
+    load_exceptions.clear()
 
-def _section_row(title):
-    return [title, "", "", "", ""]
 
-def _header_row(col2="Entry"):
-    return ["Check / Field", col2, "Notes / Details", "Status", "Critical?"]
+# ─── Building sheet rows ──────────────────────────────────────────────────────
+BLANK = [""]
 
-def _dr(field, entry="", notes="", status="", critical=""):
-    return [field, str(entry) if entry is not None else "", notes, status, critical]
+def sections_to_rows(sections, vals):
+    rows = []
+    for title, items in sections:
+        rows.append([title, "", "", "", ""])
+        rows.append(["Check / Field", "Entry", "Notes / Details", "Status", "Critical?"])
+        for it in items:
+            v, note = vals[it["key"]]
+            rows.append([it["label"], str(v), note, "", "CRITICAL" if it["crit"] else ""])
+        rows.append(BLANK)
+    return rows
 
-def _exc_header():
-    return ["Issue / Exception", "Action Taken", "Escalated To",
-            "Follow-up by", "Follow-up Date", "Status"]
+def exceptions_to_rows(title, exceptions):
+    rows = [[title], ["Issue / Exception", "Action Taken", "Escalated To"]]
+    logged = [e for e in exceptions if e["issue"] or e["action"] or e["escalated"]]
+    for e in logged:
+        rows.append([e["issue"], e["action"], e["escalated"]])
+    if not logged:
+        rows.append(["None"])
+    rows.append(["Follow-up for these is tracked in the Exceptions Tracker."])
+    rows.append(BLANK)
+    return rows
 
-def _exc_row(exc):
-    return [exc.get("issue", ""), exc.get("action", ""), exc.get("escalated_to", ""),
-            exc.get("followup_by", ""), exc.get("followup_date", ""), exc.get("status", "")]
+def format_tab(sh, ws, rows):
+    """Bold headers / amber section bands / red CRITICAL - cosmetic only."""
+    sid, reqs = ws.id, []
 
-# ─── Sheet writers ────────────────────────────────────────────────────────────
+    def cell_fmt(r, c0, c1, fmt, fields):
+        reqs.append({"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": r, "endRowIndex": r + 1,
+                      "startColumnIndex": c0, "endColumnIndex": c1},
+            "cell": {"userEnteredFormat": fmt}, "fields": fields}})
 
-def save_day_start(d):
-    sh   = get_spreadsheet()
-    name = f"Day Start({d['date'].strftime('%d-%m')})"
-    ws   = _ws(sh, name)
+    amber = {"red": 0.94, "green": 0.76, "blue": 0.29}
+    grey  = {"red": 0.92, "green": 0.92, "blue": 0.92}
+    for i, r in enumerate(rows):
+        first = r[0] if r else ""
+        filled = sum(1 for c in r if str(c).strip())
+        if i == 0:
+            cell_fmt(i, 0, 6, {"textFormat": {"bold": True, "fontSize": 13}}, "userEnteredFormat.textFormat")
+        elif filled == 1 and re.match(r"^(\d+\.|EXCEPTIONS)", first):
+            cell_fmt(i, 0, 6, {"textFormat": {"bold": True}, "backgroundColor": amber},
+                     "userEnteredFormat(textFormat,backgroundColor)")
+        elif first in ("Check / Field", "Issue / Exception"):
+            cell_fmt(i, 0, 6, {"textFormat": {"bold": True}, "backgroundColor": grey},
+                     "userEnteredFormat(textFormat,backgroundColor)")
+        elif len(r) > 4 and r[4] == "CRITICAL":
+            cell_fmt(i, 4, 5, {"textFormat": {"bold": True, "foregroundColor": {"red": 0.9, "green": 0.1, "blue": 0.1}}},
+                     "userEnteredFormat.textFormat")
+    for col, px in enumerate([380, 150, 300, 110, 90, 150]):
+        reqs.append({"updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": col, "endIndex": col + 1},
+            "properties": {"pixelSize": px}, "fields": "pixelSize"}})
+    sh.batch_update({"requests": reqs})
 
+def write_tab(name, rows):
+    sh = get_spreadsheet()
+    width = max(6, max(len(r) for r in rows))
+    try:
+        ws = sh.worksheet(name)
+        ws.clear()
+        ws.resize(rows=len(rows) + 5, cols=width)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=name, rows=len(rows) + 5, cols=width)
+    ws.batch_update([{"range": "A1", "values": rows}], value_input_option="RAW")
+    try:
+        format_tab(sh, ws, rows)
+    except Exception:
+        pass                                     # formatting is cosmetic; never fail a save over it
+
+
+# ─── Exceptions Log (permanent sheet) ─────────────────────────────────────────
+def get_log_ws(sh):
+    try:
+        return sh.worksheet(EXC_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=EXC_TAB, rows=500, cols=len(EXC_HEADER))
+        ws.batch_update([{"range": "A1", "values": [EXC_HEADER]}], value_input_option="RAW")
+        try:
+            ws.format("A1:J1", {"textFormat": {"bold": True}})
+        except Exception:
+            pass
+        return ws
+
+def sync_exceptions(day, source, exceptions):
+    """Replace this day+source's rows in the log with the freshly submitted ones."""
+    sh = get_spreadsheet()
+    ws = get_log_ws(sh)
+    old = ws.get_all_values()
+    body = [(r + [""] * 10)[:10] for r in old[1:] if any(r)]
+    kept = [r for r in body if not (r[1] == day and r[2] == source)]
+    new = [[uuid.uuid4().hex[:8], day, source, e["issue"], e["action"], e["escalated"], "", "", "Open", ""]
+           for e in exceptions if e["issue"] or e["action"] or e["escalated"]]
+    final = [EXC_HEADER] + kept + new
+    if len(final) + 5 > ws.row_count:
+        ws.resize(rows=len(final) + 200)
+    ws.batch_update([{"range": "A1", "values": final}], value_input_option="RAW")
+    if len(old) > len(final):                    # shrunk (overwrite) - blank out the leftover rows
+        ws.batch_clear([f"A{len(final) + 1}:J{len(old)}"])
+    return len(new)
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_exceptions():
+    ws = get_log_ws(get_spreadsheet())
+    out = []
+    for r in ws.get_all_values()[1:]:
+        r = (r + [""] * 10)[:10]
+        if any(r):
+            e = dict(zip(EXC_KEYS, r))
+            e["status"] = e["status"] or "Open"
+            out.append(e)
+    out.sort(key=lambda e: e["date"])
+    return out
+
+def update_exception(exc_id, fby, fdate, status):
+    ws = get_log_ws(get_spreadsheet())
+    ids = ws.col_values(1)
+    if exc_id not in ids:
+        raise ValueError("This exception no longer exists (its day may have been re-submitted). Hit Refresh.")
+    r = ids.index(exc_id) + 1
+    resolved_on = now_ist().date().isoformat() if status == "Resolved" else ""
+    ws.batch_update([{"range": f"G{r}:J{r}", "values": [[fby, fdate, status, resolved_on]]}],
+                    value_input_option="RAW")
+
+
+# ─── Save entry points ────────────────────────────────────────────────────────
+def save_day_start(h, vals, exceptions):
+    d = h["date"]
+    name = f"Day Start({d:%d-%m})"
     rows = [
         ["WAREHOUSE — DAY START CHECKLIST"],
         ["Complete after arrival (approx 10:00). Critical items are highlighted. "
          "Closing Supervisor owns Day End checklist."],
-        ["Date", str(d["date"]), "Day", d["date"].strftime("%A"),
-         "Time checked", d["time_checked"]],
-        ["Completed by", d["completed_by"], "Supervisor", d["supervisor"],
-         "Overall Status", d["overall_status"]],
-        [],
-
-        # ── 1. Environment ────────────────────────────────────────────────────
-        _section_row("1. ENVIRONMENT & WAREHOUSE READINESS"),
-        _header_row(),
+        ["Date", d.isoformat(), "Day", d.strftime("%A"), "Time checked", h["time"]],
+        ["Completed by", h["by"], "Supervisor", h["supervisor"], "Overall Status", h["status"]],
+        BLANK,
     ]
-    e = d["env"]
-    rows += [
-        _dr("AC / climate control working",             e["ac"],             e["ac_notes"]),
-        _dr("Temperature (°C)",                         e["temp"]),
-        _dr("Humidity (%)",                             e["humidity"]),
-        _dr("Humidifier / dehumidifier status",         e["humidifier"],     e["humidifier_notes"]),
-        _dr("Pest / insect / rodent activity observed", e["pest"],           e["pest_notes"]),
-        _dr("Aisles / walking paths clear",             e["aisles"],         e["aisles_notes"]),
-        _dr("Shelves / work areas tidy",                e["shelves"]),
-        _dr("Packing tables clean",                     e["packing_tables"], e["packing_tables_notes"]),
-        [],
+    rows += sections_to_rows(DS_SECTIONS, vals)
+    rows += exceptions_to_rows("EXCEPTIONS / ISSUES LOG", exceptions)
+    rows.append(["Completed by (signature/name)", h["by"], "", "Supervisor verification"])
+    write_tab(name, rows)
+    n = sync_exceptions(d.isoformat(), "Day Start", exceptions)
+    return name, n
 
-        # ── 2. Stock ──────────────────────────────────────────────────────────
-        _section_row("2. STOCK & STORAGE READINESS"),
-        _header_row(),
-    ]
-    s = d["stock"]
-    rows += [
-        _dr("Stock left in temporary / unusual locations",        s["unusual"],     s["unusual_notes"]),
-        _dr("Stock on floor that should be shelved",              s["floor"],       s["floor_notes"]),
-        _dr("LT → ST movement still required?",                   s["lt_st"],       "", "", "CRITICAL"),
-        _dr("Cubicles still needing movement (e.g. A3, B1, C7)", s["cubicles"],    "", "", "CRITICAL"),
-        _dr("Damaged / open stock requiring attention",           s["damaged"],     "", "", "CRITICAL"),
-        _dr("Stock discrepancy carried over from previous day",   s["discrepancy"], s["discrepancy_notes"]),
-        [],
-
-        # ── 3. Queue ──────────────────────────────────────────────────────────
-        _section_row("3. SAMASYA / OPERATIONAL QUEUE (at time of check)"),
-        _header_row(),
-    ]
-    q = d["queue"]
-    rows += [
-        _dr("Orders still in ASSEMBLING",  q["assembling"], "", "", "CRITICAL"),
-        _dr("Orders still in PACKING",     q["packing"],    "", "", "CRITICAL"),
-        _dr("RTO queue requiring action",  q["rto"]),
-        _dr("DTO queue requiring action",  q["dto"]),
-        _dr("Notes pending",               q["notes"]),
-        [],
-
-        # ── 4. Equipment ──────────────────────────────────────────────────────
-        _section_row("4. EQUIPMENT & PACKING READINESS"),
-        _header_row(),
-    ]
-    eq = d["equip"]
-    rows += [
-        _dr("Tablets working",                              eq["tablets"],         "", "", "CRITICAL"),
-        _dr("Scanner working",                              eq["scanner"],         "", "", "CRITICAL"),
-        _dr("Printers working",                             eq["printers"],        "", "", "CRITICAL"),
-        _dr("Weighing scales working",                      eq["scales"],          "", "", "CRITICAL"),
-        _dr("Thermal rolls available",                      eq["thermal"]),
-        _dr("Boxes available",                              eq["boxes"],           "", "", "CRITICAL"),
-        _dr("Pouches available",                            eq["pouches"],         "", "", "CRITICAL"),
-        _dr("Bubble wrap / protective material available",  eq["bubble_wrap"],     "", "", "CRITICAL"),
-        _dr("Tape available",                               eq["tape"]),
-        _dr("Packing station ready",                        eq["packing_station"]),
-        _dr("Any equipment issue / note",                   eq["eq_issue"],        "", "", "CRITICAL"),
-        _dr("Cameras working",                              eq["cameras"],         eq["cameras_notes"]),
-        [],
-
-        # ── Exceptions ────────────────────────────────────────────────────────
-        ["EXCEPTIONS / ISSUES LOG"],
-        _exc_header(),
-    ]
-    for exc in d["exceptions"]:
-        if any(exc.values()):
-            rows.append(_exc_row(exc))
-
-    rows.append(["Completed by (signature/name)", d["completed_by"], "", "Supervisor verification"])
-
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
-    return name
-
-
-def save_day_end(d):
-    sh   = get_spreadsheet()
-    name = f"Day End({d['date'].strftime('%d-%m')})"
-    ws   = _ws(sh, name)
-
+def save_day_end(h, vals, exceptions):
+    d = h["date"]
+    name = f"Day End({d:%d-%m})"
     rows = [
         ["WAREHOUSE — DAY END CHECKLIST"],
         ["TO BE COMPLETED BY CLOSING SUPERVISOR / SENIOR EXEC (target ~7:00 PM). "
          "Critical items highlighted. Review next morning."],
-        ["Date", str(d["date"]), "Day", d["date"].strftime("%A"),
-         "Time completed", d["time_completed"]],
-        ["Completed by (Closing Supervisor)", d["completed_by"],
-         "Overall Status", d["overall_status"]],
-        [],
-
-        # ── 1. Order Closure ──────────────────────────────────────────────────
-        _section_row("1. ORDER CLOSURE / WORKLOAD CARRIED FORWARD  ★ CRITICAL"),
-        _header_row("Entry / Count"),
+        ["Date", d.isoformat(), "Day", d.strftime("%A"), "Time completed", h["time"]],
+        ["Completed by (Closing Supervisor)", h["by"], "Overall Status", h["status"]],
+        BLANK,
     ]
-    o = d["orders"]
-    rows += [
-        _dr("Orders remaining in ASSEMBLING",           o["assembling"],  "", "", "CRITICAL"),
-        _dr("Orders remaining in PACKING",              o["packing"],     "", "", "CRITICAL"),
-        _dr("Orders remaining in READY FOR SHIPPING",   o["rfs"],         "", "", "CRITICAL"),
-        _dr("Issue / Exception",                        o["issue"],       o["issue_notes"], "", "CRITICAL"),
-        _dr("Courier handovers completed / recorded",   o["courier"],     o["courier_notes"]),
-        [],
-
-        # ── 2. Move List ──────────────────────────────────────────────────────
-        _section_row("2. MOVE LIST / CHECKING"),
-        _header_row(),
-    ]
-    m = d["move"]
-    rows += [
-        _dr("Move List reviewed",                          m["move_list"]),
-        _dr("Cubicles still pending LT → ST",             m["cubicles"],      "", "", "CRITICAL"),
-        _dr("Checking reviewed",                           m["checking"]),
-        _dr("Outstanding discrepancies",                   m["discrepancies"]),
-        [],
-
-        # ── 3. RTO / DTO ──────────────────────────────────────────────────────
-        _section_row("3. RTO / DTO"),
-        _header_row(),
-    ]
-    rt = d["rto"]
-    rows += [
-        _dr("RTOs processed today",               rt["rto_processed"]),
-        _dr("Unresolved RTO discrepancies",       rt["rto_disc"]),
-        _dr("DTOs processed today",               rt["dto_processed"]),
-        _dr("Unresolved DTO discrepancies",       rt["dto_disc"]),
-        _dr("Returned stock requiring restocking", rt["restocking"]),
-        [],
-
-        # ── 4. Warehouse Reset ────────────────────────────────────────────────
-        _section_row("4. WAREHOUSE RESET  ★ CRITICAL (Close Clean)"),
-        _header_row(),
-    ]
-    rs = d["reset"]
-    rows += [
-        _dr("Loose stock returned to appropriate location", rs["loose_stock"],       rs["loose_stock_notes"],  "", "CRITICAL"),
-        _dr("LT → ST movement completed",                   rs["lt_st"],             rs["lt_st_notes"],        "", "CRITICAL"),
-        _dr("Packing materials replenished",                rs["packing_materials"], "", "", "CRITICAL"),
-        _dr("Picking / assembly area reset",                rs["assembly_reset"],    "", "", "CRITICAL"),
-        _dr("Packing tables cleared",                       rs["packing_tables"],    "", "", "CRITICAL"),
-        _dr("Aisles clear",                                 rs["aisles"],            "", "", "CRITICAL"),
-        [],
-
-        # ── 5. Equipment ──────────────────────────────────────────────────────
-        _section_row("5. EQUIPMENT"),
-        _header_row(),
-    ]
-    eq = d["equip"]
-    rows += [
-        _dr("Tablets kept on charge",            eq["tablets"]),
-        _dr("Scanners kept on charge / stored",  eq["scanner"]),
-        _dr("Printers left ready for next day",  eq["printers"]),
-        _dr("Weighing scales left ready",        eq["scales"]),
-        _dr("Camera working",                    eq["cameras"]),
-        [],
-
-        # ── 6. Environment ────────────────────────────────────────────────────
-        _section_row("6. ENVIRONMENT"),
-        _header_row(),
-    ]
-    en = d["env"]
-    rows += [
-        _dr("Final temperature (°C)",                      en["temp"]),
-        _dr("Final humidity (%)",                          en["humidity"]),
-        _dr("AC / climate control set for overnight",      en["ac"]),
-        _dr("Humidifier / dehumidifier set appropriately", en["humidifier"]),
-        _dr("Final pest / insect / rodent observation",    en["pest"]),
-        [],
-
-        # ── Exceptions ────────────────────────────────────────────────────────
-        ["EXCEPTIONS / ISSUES LOG (Hand-over for next day)"],
-        _exc_header(),
-    ]
-    for exc in d["exceptions"]:
-        if any(exc.values()):
-            rows.append(_exc_row(exc))
-
-    rows.append(["Completed by (Closing Supervisor)", d["completed_by"],
-                 "", "Next-day review by", "", d.get("next_day_review", "")])
-
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
-    return name
+    rows += sections_to_rows(DE_SECTIONS, vals)
+    rows += exceptions_to_rows("EXCEPTIONS / ISSUES LOG (Hand-over for next day)", exceptions)
+    rows.append(["Completed by (Closing Supervisor)", h["by"], "", "Next-day review by", "", h["review"]])
+    write_tab(name, rows)
+    n = sync_exceptions(d.isoformat(), "Day End", exceptions)
+    return name, n
 
 
-# ─── Shared UI helpers ────────────────────────────────────────────────────────
+# ─── Styling ──────────────────────────────────────────────────────────────────
+CSS = f"""
+<style>
+.stApp {{ background:#fff; }}
+header[data-testid="stHeader"] {{ background:transparent; }}
+.block-container {{ padding-top:1.2rem; max-width:1150px; }}
+div[data-testid="stVerticalBlock"] {{ gap:.45rem; }}
 
-def yn(label, key):
-    return st.selectbox(label, ["Yes", "No"], key=key)
+.banner {{ background:{GREEN}; border-radius:4px; padding:18px 10px 16px; text-align:center; margin-bottom:14px; }}
+.banner .bt {{ color:{NAVY}; font-size:2.1rem; font-weight:800; line-height:1.1; }}
+.banner .bs {{ color:#0b1f4d; font-size:1.05rem; font-weight:600; margin-top:4px; }}
+.banner .pill {{ display:inline-block; background:{DARK}; color:#fff; font-size:.8rem; font-weight:700;
+                 padding:3px 12px; border-radius:4px; margin-top:10px; }}
 
-def exceptions_section(prefix):
-    st.markdown("**Exceptions / Issues Log**")
-    count_key = f"{prefix}_exc_n"
-    if count_key not in st.session_state:
-        st.session_state[count_key] = 0
+.stTabs [data-baseweb="tab-list"] {{ gap:3px; }}
+.stTabs [data-baseweb="tab"] {{ height:auto; padding:10px 22px; border-radius:0; font-weight:700;
+                                background:{AMBER}; color:#3b2a00; }}
+.stTabs [data-baseweb="tab"]:nth-child(3) {{ background:{BLUE}; color:#fff; }}
+.stTabs [data-baseweb="tab"]:nth-child(4) {{ background:#5CCB5F; color:#fff; }}
+.stTabs [data-baseweb="tab"][aria-selected="true"] {{ background:{ORANGE}; color:#fff;
+                                box-shadow:0 3px 7px rgba(0,0,0,.35); }}
+.stTabs [data-baseweb="tab"] p {{ color:inherit; font-weight:700; }}
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] {{ display:none; }}
 
-    n = st.session_state[count_key]
-    exceptions = []
+div.stButton > button {{ background:{DARK}; color:#fff; border:0; border-radius:4px; font-weight:700; }}
+div.stButton > button:hover {{ background:#000; color:#fff; }}
+div.stButton > button p {{ color:#fff; }}
 
-    if n > 0:
-        hcols = st.columns([3, 3, 2, 2, 2, 2])
-        for h, col in zip(
-            ["Issue / Exception", "Action Taken", "Escalated To",
-             "Follow-up by", "Follow-up Date", "Status"],
-            hcols,
-        ):
-            col.markdown(f"<small><b>{h}</b></small>", unsafe_allow_html=True)
+.sec {{ background:{AMBER}; color:#3b2a00; font-weight:800; padding:7px 12px; margin:18px 0 4px;
+        border-radius:3px; letter-spacing:.2px; }}
+.colh {{ font-size:.7rem; color:#6b7280; font-weight:700; letter-spacing:.6px; }}
+.lbl {{ font-weight:500; color:#111; }}
+.hl {{ background:#FFFF00; padding:1px 4px; font-weight:600; color:#111; }}
+.crit {{ background:{RED}; color:#fff; font-size:.6rem; font-weight:800; padding:1px 6px;
+         border-radius:3px; margin-left:6px; vertical-align:middle; }}
 
+.exc {{ border-left:6px solid #999; padding:4px 10px 6px; }}
+.exc .chip {{ color:#fff; font-size:.7rem; font-weight:800; padding:2px 9px; border-radius:3px; margin-right:6px; }}
+.exc .meta {{ font-weight:700; color:#111; }}
+.exc div.l {{ margin-top:3px; color:#222; }}
+
+.vt-title {{ font-size:1.15rem; font-weight:800; margin:4px 0 6px; }}
+.vt-sec {{ background:{AMBER}; font-weight:800; padding:5px 10px; margin-top:12px; color:#3b2a00; }}
+.vt table {{ width:100%; border-collapse:collapse; font-size:.86rem; }}
+.vt td {{ border-bottom:1px solid #eee; padding:3px 6px; vertical-align:top; color:#111; }}
+.vt tr.h td {{ background:#EBEBEB; font-weight:700; }}
+.vt td.crit {{ color:{RED}; font-weight:800; }}
+.vt .note {{ color:#444; font-size:.85rem; margin:3px 0; }}
+</style>
+"""
+
+
+# ─── UI helpers ───────────────────────────────────────────────────────────────
+def render_sections(prefix, sections):
+    """One row per check: label | entry | notes. Returns {key: (value, note)}."""
+    out = {}
+    for title, items in sections:
+        st.markdown(f'<div class="sec">{html.escape(title)}</div>', unsafe_allow_html=True)
+        h = st.columns([4, 2, 4])
+        for c, t in zip(h, ["CHECK", "ENTRY", "NOTES (OPTIONAL)"]):
+            c.markdown(f'<div class="colh">{t}</div>', unsafe_allow_html=True)
+        for it in items:
+            c1, c2, c3 = st.columns([4, 2, 4], vertical_alignment="center")
+            lab = html.escape(it["label"])
+            if it["crit"]:
+                c1.markdown(f'<span class="hl">{lab}</span><span class="crit">CRITICAL</span>',
+                            unsafe_allow_html=True)
+            else:
+                c1.markdown(f'<span class="lbl">{lab}</span>', unsafe_allow_html=True)
+            k = f"{prefix}_{it['key']}"
+            with c2:
+                if it["kind"] == "yn":
+                    v = st.selectbox(it["label"], ["Yes", "No"], key=k, label_visibility="collapsed")
+                elif it["kind"] == "num":
+                    v = int(st.number_input(it["label"], min_value=0, step=1, key=k,
+                                            label_visibility="collapsed"))
+                else:
+                    v = st.text_input(it["label"], key=k, placeholder=it["ph"],
+                                      label_visibility="collapsed")
+            n = c3.text_input(it["label"] + " notes", key=k + "_n", placeholder="Notes",
+                              label_visibility="collapsed")
+            out[it["key"]] = (v, n)
+    return out
+
+def exceptions_input(prefix):
+    st.markdown('<div class="sec">EXCEPTIONS / ISSUES</div>', unsafe_allow_html=True)
+    st.caption("Log the issue, what was done, and who it was escalated to. "
+               "Follow-up is handled later in the Exceptions Tracker tab.")
+    nkey = f"{prefix}_exc_n"
+    st.session_state.setdefault(nkey, 0)
+    n = st.session_state[nkey]
+    out = []
+    if n:
+        h = st.columns([4, 4, 2])
+        for c, t in zip(h, ["ISSUE / EXCEPTION", "ACTION TAKEN", "ESCALATED TO"]):
+            c.markdown(f'<div class="colh">{t}</div>', unsafe_allow_html=True)
     for i in range(n):
-        cols = st.columns([3, 3, 2, 2, 2, 2])
-        exc = {
-            "issue":         cols[0].text_input("Issue",        key=f"{prefix}_ei_{i}", label_visibility="collapsed"),
-            "action":        cols[1].text_input("Action",       key=f"{prefix}_ea_{i}", label_visibility="collapsed"),
-            "escalated_to":  cols[2].text_input("Escalated To", key=f"{prefix}_ee_{i}", label_visibility="collapsed"),
-            "followup_by":   cols[3].text_input("Follow-up by", key=f"{prefix}_ef_{i}", label_visibility="collapsed"),
-            "followup_date": cols[4].text_input("Date",         key=f"{prefix}_ed_{i}", label_visibility="collapsed",
-                                                placeholder="DD-MM-YYYY"),
-            "status":        cols[5].text_input("Status",       key=f"{prefix}_es_{i}", label_visibility="collapsed"),
-        }
-        exceptions.append(exc)
+        c = st.columns([4, 4, 2])
+        out.append({
+            "issue":     c[0].text_input("Issue",        key=f"{prefix}_ei_{i}", label_visibility="collapsed"),
+            "action":    c[1].text_input("Action taken", key=f"{prefix}_ea_{i}", label_visibility="collapsed"),
+            "escalated": c[2].text_input("Escalated to", key=f"{prefix}_ee_{i}", label_visibility="collapsed"),
+        })
+    b = st.columns([1.3, 1.6, 6])
+    if b[0].button("＋ Add exception", key=f"{prefix}_add_exc"):
+        st.session_state[nkey] += 1
+        st.rerun()
+    if n and b[1].button("− Remove last", key=f"{prefix}_rm_exc"):
+        for k in ("ei", "ea", "ee"):
+            st.session_state.pop(f"{prefix}_{k}_{n - 1}", None)
+        st.session_state[nkey] -= 1
+        st.rerun()
+    return out
 
-    if st.button("＋ Add exception", key=f"{prefix}_add_exc"):
-        st.session_state[count_key] += 1
+def submit_gate(prefix, label, name):
+    """Renders the submit button; True only when it's OK to write (handles overwrite confirm)."""
+    if name in existing_tabs():
+        st.warning(f"⚠️ **{name}** already exists. Submitting will **replace it completely**, "
+                   "including the exceptions logged from it.")
+    if not st.button(f"✅  Submit {label} Checklist", type="primary",
+                     use_container_width=True, key=f"{prefix}_submit"):
+        return False
+    if tab_exists_fresh(name) and st.session_state.get(f"{prefix}_armed") != name:
+        st.session_state[f"{prefix}_armed"] = name
+        st.error(f"An entry for **{name}** already exists. Click Submit again to overwrite it.")
+        return False
+    return True
+
+def pretty_date(iso):
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%d %b %Y")
+    except ValueError:
+        return iso
+
+def parse_iso(iso):
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+def tab_html(vals):
+    """Read-only render of a saved day sheet."""
+    out, table = ['<div class="vt">'], []
+
+    def flush():
+        if table:
+            out.append("<table>" + "".join(table) + "</table>")
+            table.clear()
+
+    for i, r in enumerate(vals):
+        filled = [c for c in r if c.strip()]
+        if not filled:
+            flush()
+            continue
+        first = r[0].strip()
+        if i == 0:
+            out.append(f'<div class="vt-title">{html.escape(first)}</div>')
+        elif len(filled) == 1 and re.match(r"^(\d+\.|EXCEPTIONS)", first):
+            flush()
+            out.append(f'<div class="vt-sec">{html.escape(first)}</div>')
+        elif len(filled) == 1:
+            flush()
+            out.append(f'<div class="note">{html.escape(first)}</div>')
+        else:
+            head = first in ("Check / Field", "Issue / Exception")
+            cells = "".join(
+                f'<td class="{"crit" if c == "CRITICAL" else ""}">{html.escape(c)}</td>' for c in r)
+            table.append(f'<tr class="{"h" if head else ""}">{cells}</tr>')
+    flush()
+    out.append("</div>")
+    return "".join(out)
+
+
+# ─── Page ─────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="SayaCare Checklist", layout="wide", page_icon="🏭")
+st.markdown(CSS, unsafe_allow_html=True)
+st.markdown(
+    '<div class="banner"><div class="bt">Warehouse Checklist</div>'
+    '<div class="bs">SayaCare Operations</div><span class="pill">Location: Noida</span></div>',
+    unsafe_allow_html=True)
+
+# Optional password gate: add  app_password = "..."  to the Streamlit secrets to switch it on.
+try:
+    _pw = st.secrets["app_password"]
+except Exception:
+    _pw = None
+if _pw and not st.session_state.get("authed"):
+    entered = st.text_input("Password", type="password")
+    if entered and hmac.compare_digest(entered, str(_pw)):
+        st.session_state["authed"] = True
+        st.rerun()
+    elif entered:
+        st.error("Wrong password")
+    st.stop()
+
+tab_ds, tab_de, tab_ex, tab_view = st.tabs(
+    ["Day Start", "Day End", "Exceptions Tracker", "View Entry"])
+
+# ═══════════════════════════ DAY START ════════════════════════════════════════
+with tab_ds:
+    c = st.columns(4)
+    ds_date   = c[0].date_input("Date", value=now_ist().date(), key="ds_date", format="DD/MM/YYYY")
+    ds_by     = c[1].selectbox("Completed by", SUPERVISORS, key="ds_by")
+    ds_sup    = c[2].selectbox("Supervisor", SUPERVISORS, key="ds_sup")
+    ds_status = c[3].selectbox("Overall status", ["Green", "Amber", "Red"], key="ds_status")
+
+    ds_vals = render_sections("ds", DS_SECTIONS)
+    ds_exc  = exceptions_input("ds")
+    st.divider()
+
+    ds_name = f"Day Start({ds_date:%d-%m})"
+    if submit_gate("ds", "Day Start", ds_name):
+        try:
+            header = {"date": ds_date, "time": now_ist().strftime("%H:%M"),
+                      "by": ds_by, "supervisor": ds_sup, "status": ds_status}
+            name, n = save_day_start(header, ds_vals, ds_exc)
+            st.session_state.pop("ds_armed", None)
+            clear_caches()
+            st.success(f"✅ Saved as **{name}**" + (f" · {n} exception(s) logged" if n else ""))
+        except Exception as ex:
+            st.error(f"Error saving: {ex}")
+
+# ═══════════════════════════ DAY END ══════════════════════════════════════════
+with tab_de:
+    c = st.columns(4)
+    de_date   = c[0].date_input("Date", value=now_ist().date(), key="de_date", format="DD/MM/YYYY")
+    de_by     = c[1].selectbox("Completed by (Closing Supervisor)", SUPERVISORS, key="de_by")
+    de_review = c[2].selectbox("Next-day review by", ["—"] + SUPERVISORS, key="de_review")
+    de_status = c[3].selectbox("Overall status", ["Green", "Amber", "Red"], key="de_status")
+
+    de_vals = render_sections("de", DE_SECTIONS)
+    de_exc  = exceptions_input("de")
+    st.divider()
+
+    de_name = f"Day End({de_date:%d-%m})"
+    if submit_gate("de", "Day End", de_name):
+        try:
+            header = {"date": de_date, "time": now_ist().strftime("%H:%M"), "by": de_by,
+                      "review": "" if de_review == "—" else de_review, "status": de_status}
+            name, n = save_day_end(header, de_vals, de_exc)
+            st.session_state.pop("de_armed", None)
+            clear_caches()
+            st.success(f"✅ Saved as **{name}**" + (f" · {n} exception(s) logged" if n else ""))
+        except Exception as ex:
+            st.error(f"Error saving: {ex}")
+
+# ═══════════════════════════ EXCEPTIONS TRACKER ═══════════════════════════════
+with tab_ex:
+    top = st.columns([1.3, 1, 5])
+    show_resolved = top[0].checkbox("Show resolved", key="ex_show_resolved")
+    if top[1].button("↻ Refresh", key="ex_refresh"):
+        clear_caches()
         st.rerun()
 
-    return exceptions
+    try:
+        allx = load_exceptions()
+    except Exception as ex:
+        allx = None
+        st.error(f"Could not load exceptions: {ex}")
 
+    if allx is not None:
+        today = now_ist().date()
+        open_x = [e for e in allx if e["status"] != "Resolved"]
+        overdue = [e for e in open_x if (parse_iso(e["fdate"]) or date.max) < today]
+        if open_x:
+            st.markdown(f"**{len(open_x)} open**" + (f" · :red[{len(overdue)} overdue]" if overdue else ""))
+        else:
+            st.success("No open exceptions. 🎉")
 
-# ─── Page layout ──────────────────────────────────────────────────────────────
+        for e in open_x:
+            fd = parse_iso(e["fdate"])
+            is_over = bool(fd and fd < today)
+            col = STATUS_COLOUR.get(e["status"], RED)
+            with st.container(border=True):
+                chips = f'<span class="chip" style="background:{col}">{html.escape(e["status"].upper())}</span>'
+                if is_over:
+                    chips += f'<span class="chip" style="background:#7f0000">OVERDUE</span>'
+                st.markdown(
+                    f'<div class="exc" style="border-left-color:{col}">{chips}'
+                    f'<span class="meta">{pretty_date(e["date"])} · {html.escape(e["source"])}</span>'
+                    f'<div class="l"><b>Issue:</b> {html.escape(e["issue"])}</div>'
+                    f'<div class="l"><b>Action taken:</b> {html.escape(e["action"]) or "—"}</div>'
+                    f'<div class="l"><b>Escalated to:</b> {html.escape(e["escalated"]) or "—"}</div></div>',
+                    unsafe_allow_html=True)
+                f = st.columns([2, 2, 2, 1.2], vertical_alignment="bottom")
+                fby    = f[0].text_input("Follow-up by", value=e["fby"], key=f"ex_fby_{e['id']}")
+                fdate  = f[1].date_input("Follow-up date", value=fd, key=f"ex_fd_{e['id']}", format="DD/MM/YYYY")
+                status = f[2].selectbox("Status", STATUSES, index=STATUSES.index(e["status"]),
+                                        key=f"ex_st_{e['id']}")
+                if f[3].button("Save", key=f"ex_save_{e['id']}", use_container_width=True):
+                    try:
+                        update_exception(e["id"], fby, fdate.isoformat() if fdate else "", status)
+                        clear_caches()
+                        st.toast("Resolved — removed from tracker" if status == "Resolved" else "Saved")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Could not save: {ex}")
 
-st.set_page_config(page_title="SayaCare Checklist", layout="wide", page_icon="🏭")
-st.title("🏭 SayaCare Warehouse — Daily Checklist")
+        if show_resolved:
+            done = [e for e in allx if e["status"] == "Resolved"]
+            st.markdown('<div class="sec">RESOLVED</div>', unsafe_allow_html=True)
+            if not done:
+                st.caption("Nothing resolved yet.")
+            for e in reversed(done):
+                st.markdown(
+                    f'<div class="exc" style="border-left-color:{OKGREEN}">'
+                    f'<span class="chip" style="background:{OKGREEN}">RESOLVED</span>'
+                    f'<span class="meta">{pretty_date(e["date"])} · {html.escape(e["source"])}</span>'
+                    f'<div class="l"><b>Issue:</b> {html.escape(e["issue"])} — '
+                    f'<b>Action:</b> {html.escape(e["action"]) or "—"} — '
+                    f'<b>Escalated to:</b> {html.escape(e["escalated"]) or "—"}</div>'
+                    f'<div class="l">Follow-up by {html.escape(e["fby"]) or "—"} · '
+                    f'resolved {pretty_date(e["resolved_on"])}</div></div>',
+                    unsafe_allow_html=True)
 
-tab_ds, tab_de = st.tabs(["📋  Day Start", "📦  Day End"])
-
-# ═══════════════════════════ DAY START TAB ════════════════════════════════════
-with tab_ds:
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: ds_date   = st.date_input("Date",          value=date.today(), key="ds_date")
-    with c2: ds_by     = st.selectbox("Completed by",   SUPERVISORS,        key="ds_by")
-    with c3: ds_sup    = st.selectbox("Supervisor",     SUPERVISORS,        key="ds_sup")
-    with c4: ds_status = st.selectbox("Overall Status", ["Green","Amber","Red"], key="ds_status")
-
-    st.divider()
-
-    with st.expander("1. Environment & Warehouse Readiness", expanded=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            ds_ac               = yn("AC / climate control working",             "ds_ac")
-            ds_ac_notes         = st.text_input("AC notes",          key="ds_ac_notes",      placeholder="Notes / details")
-            ds_temp             = st.text_input("Temperature (°C)",  key="ds_temp",          placeholder="e.g. 24")
-            ds_humidity         = st.text_input("Humidity (%)",      key="ds_humidity",      placeholder="e.g. 45")
-        with c2:
-            ds_humidifier       = st.text_input("Humidifier / dehumidifier status", key="ds_humidifier",
-                                                placeholder="Working / Stopped / Not Working")
-            ds_humidifier_notes = st.text_input("Humidifier notes",  key="ds_humidifier_notes",
-                                                placeholder="Notes / details")
-            ds_pest             = yn("Pest / insect / rodent activity observed",   "ds_pest")
-            ds_pest_notes       = st.text_input("Pest notes",        key="ds_pest_notes",    placeholder="Notes / details")
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            ds_aisles            = yn("Aisles / walking paths clear", "ds_aisles")
-            ds_aisles_notes      = st.text_input("Aisles notes",      key="ds_aisles_notes",  placeholder="Notes / details")
-        with c2:
-            ds_shelves           = yn("Shelves / work areas tidy",    "ds_shelves")
-        with c3:
-            ds_packing_tables       = yn("Packing tables clean",      "ds_packing_tables")
-            ds_packing_tables_notes = st.text_input("Packing tables notes", key="ds_pt_notes",
-                                                    placeholder="Notes / details")
-
-    with st.expander("2. Stock & Storage Readiness", expanded=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            ds_unusual       = yn("Stock left in temporary / unusual locations", "ds_unusual")
-            ds_unusual_notes = st.text_input("Unusual notes",   key="ds_unusual_notes", placeholder="Notes / details")
-            ds_floor         = yn("Stock on floor that should be shelved",       "ds_floor")
-            ds_floor_notes   = st.text_input("Floor notes",     key="ds_floor_notes",   placeholder="Notes / details")
-        with c2:
-            ds_lt_st         = yn("★ LT → ST movement still required?",         "ds_lt_st")
-            ds_cubicles      = st.text_input("★ Cubicles still needing movement (count or list, e.g. A3 B1)",
-                                             key="ds_cubicles")
-            ds_damaged       = yn("★ Damaged / open stock requiring attention",  "ds_damaged")
-            ds_discrepancy   = st.text_input("Stock discrepancy carried over from previous day",
-                                             key="ds_discrepancy", placeholder="None / describe")
-            ds_discrepancy_notes = st.text_input("Discrepancy notes", key="ds_disc_notes",
-                                                 placeholder="Notes / details")
-
-    with st.expander("3. Samasya / Operational Queue", expanded=True):
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1: ds_assembling    = st.number_input("★ Assembling",  min_value=0, step=1, key="ds_assembling")
-        with c2: ds_packing_q     = st.number_input("★ Packing",     min_value=0, step=1, key="ds_packing_q")
-        with c3: ds_rto           = st.number_input("RTO queue",      min_value=0, step=1, key="ds_rto")
-        with c4: ds_dto           = st.number_input("DTO queue",      min_value=0, step=1, key="ds_dto")
-        with c5: ds_notes_pending = st.number_input("Notes pending",  min_value=0, step=1, key="ds_notes")
-
-    with st.expander("4. Equipment & Packing Readiness", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            ds_tablets     = yn("★ Tablets working",    "ds_tablets")
-            ds_thermal     = yn("Thermal rolls",         "ds_thermal")
-            ds_bubble_wrap = yn("★ Bubble wrap",         "ds_bubble_wrap")
-        with c2:
-            ds_scanner     = yn("★ Scanner working",    "ds_scanner")
-            ds_boxes       = yn("★ Boxes available",    "ds_boxes")
-            ds_tape        = yn("Tape available",        "ds_tape")
-        with c3:
-            ds_printers    = yn("★ Printers working",   "ds_printers")
-            ds_pouches     = yn("★ Pouches available",  "ds_pouches")
-            ds_pst_ready   = yn("Packing station ready","ds_pst_ready")
-        with c4:
-            ds_scales      = yn("★ Weighing scales working", "ds_scales")
-
-        ds_eq_issue   = st.text_input("★ Any equipment issue / note", key="ds_eq_issue",
-                                      placeholder="None / describe")
-        c1, c2 = st.columns([1, 2])
-        with c1: ds_cameras       = st.text_input("Cameras working", key="ds_cameras",
-                                                   placeholder="Yes / describe issue")
-        with c2: ds_cameras_notes = st.text_input("Cameras notes",   key="ds_cam_notes",
-                                                   placeholder="Notes / details",
-                                                   label_visibility="collapsed")
-
-    st.divider()
-    ds_exceptions = exceptions_section("ds")
-
-    st.divider()
-    if st.button("✅  Submit Day Start Checklist", type="primary",
-                 use_container_width=True, key="ds_submit"):
-        data = {
-            "date":           ds_date,
-            "time_checked":   datetime.now().strftime("%H:%M"),
-            "completed_by":   ds_by,
-            "supervisor":     ds_sup,
-            "overall_status": ds_status,
-            "env": {
-                "ac": ds_ac, "ac_notes": ds_ac_notes,
-                "temp": ds_temp, "humidity": ds_humidity,
-                "humidifier": ds_humidifier, "humidifier_notes": ds_humidifier_notes,
-                "pest": ds_pest, "pest_notes": ds_pest_notes,
-                "aisles": ds_aisles, "aisles_notes": ds_aisles_notes,
-                "shelves": ds_shelves,
-                "packing_tables": ds_packing_tables,
-                "packing_tables_notes": ds_packing_tables_notes,
-            },
-            "stock": {
-                "unusual": ds_unusual, "unusual_notes": ds_unusual_notes,
-                "floor": ds_floor, "floor_notes": ds_floor_notes,
-                "lt_st": ds_lt_st, "cubicles": ds_cubicles,
-                "damaged": ds_damaged,
-                "discrepancy": ds_discrepancy, "discrepancy_notes": ds_discrepancy_notes,
-            },
-            "queue": {
-                "assembling": int(ds_assembling), "packing": int(ds_packing_q),
-                "rto": int(ds_rto), "dto": int(ds_dto), "notes": int(ds_notes_pending),
-            },
-            "equip": {
-                "tablets": ds_tablets, "scanner": ds_scanner,
-                "printers": ds_printers, "scales": ds_scales,
-                "thermal": ds_thermal, "boxes": ds_boxes,
-                "pouches": ds_pouches, "bubble_wrap": ds_bubble_wrap,
-                "tape": ds_tape, "packing_station": ds_pst_ready,
-                "eq_issue": ds_eq_issue,
-                "cameras": ds_cameras, "cameras_notes": ds_cameras_notes,
-            },
-            "exceptions": ds_exceptions,
-        }
-        try:
-            sname = save_day_start(data)
-            st.success(f"✅ Saved as tab **{sname}** in Google Sheets")
-        except Exception as ex:
-            st.error(f"Error saving: {ex}")
-
-
-# ═══════════════════════════ DAY END TAB ═════════════════════════════════════
-with tab_de:
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: de_date   = st.date_input("Date",              value=date.today(),      key="de_date")
-    with c2: de_by     = st.selectbox("Completed by",       SUPERVISORS,             key="de_by")
-    with c3: de_review = st.selectbox("Next-day review by", ["—"] + SUPERVISORS,    key="de_review")
-    with c4: de_status = st.selectbox("Overall Status",     ["Green","Amber","Red"], key="de_status")
-
-    st.divider()
-
-    with st.expander("1. Order Closure / Workload Carried Forward  ★ CRITICAL", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        with c1: de_assembling = st.number_input("★ Orders remaining — ASSEMBLING", min_value=0, step=1, key="de_assembling")
-        with c2: de_packing_q  = st.number_input("★ Orders remaining — PACKING",    min_value=0, step=1, key="de_packing_q")
-        with c3: de_rfs        = st.text_input("Orders remaining — READY FOR SHIPPING",
-                                               key="de_rfs", placeholder="None / count / describe")
-
-        c1, c2 = st.columns([1, 2])
-        with c1: de_issue       = st.text_input("★ Issue / Exception",  key="de_issue",
-                                                placeholder="Order ID or None")
-        with c2: de_issue_notes = st.text_input("Issue details",         key="de_issue_notes",
-                                                placeholder="Details", label_visibility="collapsed")
-
-        c1, c2 = st.columns([1, 2])
-        with c1: de_courier       = st.text_input("Courier handovers completed / recorded",
-                                                  key="de_courier", placeholder="Yes / No / details")
-        with c2: de_courier_notes = st.text_input("Courier notes", key="de_courier_notes",
-                                                  placeholder="Notes", label_visibility="collapsed")
-
-    with st.expander("2. Move List / Checking", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: de_move_list     = yn("Move List reviewed",   "de_move_list")
-        with c2: de_checking      = yn("Checking reviewed",    "de_checking")
-        with c3: de_cubicles      = st.text_input("★ Cubicles still pending LT → ST (count or list)",
-                                                  key="de_cubicles")
-        with c4: de_discrepancies = st.text_input("Outstanding discrepancies", key="de_disc",
-                                                  placeholder="None / describe")
-
-    with st.expander("3. RTO / DTO", expanded=True):
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1: de_rto_processed = yn("RTOs processed today",               "de_rto_proc")
-        with c2: de_rto_disc      = st.text_input("Unresolved RTO disc.",     key="de_rto_disc",
-                                                  placeholder="0 / count")
-        with c3: de_dto_processed = yn("DTOs processed today",               "de_dto_proc")
-        with c4: de_dto_disc      = st.text_input("Unresolved DTO disc.",     key="de_dto_disc",
-                                                  placeholder="0 / count")
-        with c5: de_restocking    = yn("Returned stock requiring restocking", "de_restocking")
-
-    with st.expander("4. Warehouse Reset  ★ CRITICAL", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            de_loose_stock       = yn("★ Loose stock returned to appropriate location", "de_loose_stock")
-            de_loose_stock_notes = st.text_input("Loose stock notes", key="de_ls_notes",
-                                                 placeholder="Notes / details")
-        with c2:
-            de_lt_st             = yn("★ LT → ST movement completed", "de_lt_st")
-            de_lt_st_notes       = st.text_input("LT→ST notes",        key="de_ltst_notes",
-                                                 placeholder="Notes / details")
-        with c3:
-            de_packing_materials = yn("★ Packing materials replenished", "de_packing_materials")
-            de_assembly_reset    = yn("★ Picking / assembly area reset",  "de_assembly_reset")
-
-        c1, c2 = st.columns(2)
-        with c1: de_packing_tables = yn("★ Packing tables cleared", "de_packing_tables")
-        with c2: de_aisles         = yn("★ Aisles clear",            "de_aisles")
-
-    with st.expander("5. Equipment", expanded=True):
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1: de_tablets  = yn("Tablets on charge",  "de_tablets")
-        with c2: de_scanner  = yn("Scanners stored",    "de_scanner")
-        with c3: de_printers = yn("Printers ready",     "de_printers")
-        with c4: de_scales   = yn("Scales left ready",  "de_scales")
-        with c5: de_cameras  = yn("Camera working",     "de_cameras")
-
-    with st.expander("6. Environment", expanded=True):
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1: de_temp       = st.text_input("Final temperature (°C)", key="de_temp",
-                                               placeholder="e.g. 24")
-        with c2: de_humidity   = st.text_input("Final humidity (%)",     key="de_humidity",
-                                               placeholder="e.g. 45")
-        with c3: de_ac         = yn("AC set for overnight",              "de_ac")
-        with c4: de_humidifier = yn("Humidifier set appropriately",      "de_humidifier")
-        with c5: de_pest       = st.text_input("Pest observation",       key="de_pest",
-                                               placeholder="None / describe")
-
-    st.divider()
-    de_exceptions = exceptions_section("de")
-
-    st.divider()
-    if st.button("✅  Submit Day End Checklist", type="primary",
-                 use_container_width=True, key="de_submit"):
-        data = {
-            "date":            de_date,
-            "time_completed":  datetime.now().strftime("%H:%M"),
-            "completed_by":    de_by,
-            "next_day_review": de_review if de_review != "—" else "",
-            "overall_status":  de_status,
-            "orders": {
-                "assembling": int(de_assembling), "packing": int(de_packing_q),
-                "rfs": de_rfs, "issue": de_issue, "issue_notes": de_issue_notes,
-                "courier": de_courier, "courier_notes": de_courier_notes,
-            },
-            "move": {
-                "move_list": de_move_list, "cubicles": de_cubicles,
-                "checking": de_checking, "discrepancies": de_discrepancies,
-            },
-            "rto": {
-                "rto_processed": de_rto_processed, "rto_disc": de_rto_disc,
-                "dto_processed": de_dto_processed, "dto_disc": de_dto_disc,
-                "restocking": de_restocking,
-            },
-            "reset": {
-                "loose_stock": de_loose_stock, "loose_stock_notes": de_loose_stock_notes,
-                "lt_st": de_lt_st, "lt_st_notes": de_lt_st_notes,
-                "packing_materials": de_packing_materials,
-                "assembly_reset": de_assembly_reset,
-                "packing_tables": de_packing_tables, "aisles": de_aisles,
-            },
-            "equip": {
-                "tablets": de_tablets, "scanner": de_scanner,
-                "printers": de_printers, "scales": de_scales, "cameras": de_cameras,
-            },
-            "env": {
-                "temp": de_temp, "humidity": de_humidity,
-                "ac": de_ac, "humidifier": de_humidifier, "pest": de_pest,
-            },
-            "exceptions": de_exceptions,
-        }
-        try:
-            sname = save_day_end(data)
-            st.success(f"✅ Saved as tab **{sname}** in Google Sheets")
-        except Exception as ex:
-            st.error(f"Error saving: {ex}")
+# ═══════════════════════════ VIEW ENTRY ═══════════════════════════════════════
+with tab_view:
+    vd = st.date_input("Date to view", value=now_ist().date(), key="view_date", format="DD/MM/YYYY")
+    try:
+        ds_v = load_tab(f"Day Start({vd:%d-%m})")
+        de_v = load_tab(f"Day End({vd:%d-%m})")
+    except Exception as ex:
+        ds_v = de_v = None
+        st.error(f"Could not load: {ex}")
+    if ds_v is None and de_v is None:
+        st.info(f"No Day Start or Day End entry found for {vd:%d-%m}.")
+    else:
+        L, R = st.columns(2)
+        with L:
+            if ds_v is None:
+                st.info("No Day Start entry for this date.")
+            else:
+                st.markdown(tab_html(ds_v), unsafe_allow_html=True)
+        with R:
+            if de_v is None:
+                st.info("No Day End entry for this date.")
+            else:
+                st.markdown(tab_html(de_v), unsafe_allow_html=True)
