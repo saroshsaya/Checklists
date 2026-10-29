@@ -2,6 +2,7 @@ import hmac
 import html
 import re
 import uuid
+import pandas as pd
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
@@ -159,6 +160,28 @@ def load_tab(name):
     except gspread.WorksheetNotFound:
         return None
 
+def explain(ex):
+    """Readable error text, with the likely fix for the usual Google Sheets problems."""
+    name, msg = type(ex).__name__, str(ex).strip()
+    low = (name + " " + msg).lower()
+    try:
+        email = st.secrets["gcp_service_account"]["client_email"]
+    except Exception:
+        email = "the service account email"
+    hint = ""
+    if "secret" in low or isinstance(ex, KeyError):
+        hint = " The Google credentials are missing from the Streamlit app's Secrets."
+    elif "notfound" in low or "404" in low or "not found" in low:
+        hint = (f" The app can't see this Google Sheet. Share it with {email} as Editor, "
+                "and check SHEET_ID in the code matches the sheet's link.")
+    elif "403" in low or "permission" in low:
+        hint = (f" Permission problem. Share the sheet with {email} as Editor, and make sure "
+                "the Google Sheets API is enabled in the Google Cloud project.")
+    elif "not supported for this document" in low or "failed_precondition" in low:
+        hint = " This file is still an Excel (.xlsx) file. In Google Sheets use File > Save as Google Sheets, then use the new link's ID."
+    return f"{name}: {msg or '(no message)'}.{hint}"
+
+
 def clear_caches():
     existing_tabs.clear()
     load_tab.clear()
@@ -297,6 +320,74 @@ def update_exception(exc_id, fby, fdate, status):
                     value_input_option="RAW")
 
 
+# ─── One-time import of exceptions from the older sheets ──────────────────────
+TAB_RE = re.compile(r"^(Day Start|Day End)\((\d{2})-(\d{2})(?:-(\d{4}))?\)")
+NOISE  = {"", "none", "n/a", "na", "nil", "-", "no"}
+
+def extract_exceptions(title, vals):
+    """Pull the 'Issue / Exception | Action Taken | Escalated To ...' table rows out of one tab."""
+    m = TAB_RE.match(title.strip())
+    if not m:
+        return []
+    source, dd, mm, yyyy = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4) or 2026)
+    try:
+        day = date(yyyy, mm, dd).isoformat()
+    except ValueError:
+        return []
+    out = []
+    for i, r in enumerate(vals):
+        r = (list(r) + [""] * 6)[:6]
+        if r[0].strip() == "Issue / Exception" and r[1].strip() == "Action Taken":
+            for row in vals[i + 1:]:
+                row = [str(c).strip() for c in (list(row) + [""] * 6)[:6]]
+                if not any(row) or row[0].startswith("Completed by"):
+                    break
+                issue, action, esc, fby = row[0], row[1], row[2], row[3]
+                if issue.lower() in NOISE and not action and not esc:
+                    continue
+                out.append({"date": day, "source": source, "issue": issue,
+                            "action": action, "escalated": esc, "fby": fby})
+    return out
+
+def scan_old_exceptions():
+    """Reads every Day Start/Day End tab in ONE request and returns new (not yet logged) exceptions."""
+    sh = get_spreadsheet()
+    titles = [w.title for w in sh.worksheets() if TAB_RE.match(w.title.strip())]
+    found = []
+    if titles:
+        res = sh.values_batch_get([f"'{t}'!A1:F80" for t in titles])
+        for t, vr in zip(titles, res.get("valueRanges", [])):
+            found += extract_exceptions(t, vr.get("values", []))
+    have = {(e["date"], e["source"], e["issue"].strip().lower()) for e in load_exceptions()}
+    rows, seen = [], set()
+    for e in sorted(found, key=lambda e: (e["date"], e["source"])):
+        key = (e["date"], e["source"], e["issue"].strip().lower())
+        if key in have or key in seen:
+            continue
+        seen.add(key)
+        rows.append({"Import": True, "Still open": False, "Date": e["date"], "Source": e["source"],
+                     "Issue": e["issue"], "Action taken": e["action"],
+                     "Escalated to": e["escalated"], "Follow-up by": e["fby"]})
+    return pd.DataFrame(rows, columns=["Import", "Still open", "Date", "Source", "Issue",
+                                       "Action taken", "Escalated to", "Follow-up by"])
+
+def import_exceptions(df):
+    ws = get_log_ws(get_spreadsheet())
+    old = ws.get_all_values()
+    body = [(r + [""] * 10)[:10] for r in old[1:] if any(r)]
+    new = []
+    for _, r in df[df["Import"]].iterrows():
+        resolved = not bool(r["Still open"])
+        new.append([uuid.uuid4().hex[:8], r["Date"], r["Source"], r["Issue"], r["Action taken"],
+                    r["Escalated to"], r["Follow-up by"], "",
+                    "Resolved" if resolved else "Open", r["Date"] if resolved else ""])
+    final = [EXC_HEADER] + body + new
+    if len(final) + 5 > ws.row_count:
+        ws.resize(rows=len(final) + 200)
+    ws.batch_update([{"range": "A1", "values": final}], value_input_option="RAW")
+    return len(new)
+
+
 # ─── Save entry points ────────────────────────────────────────────────────────
 def save_day_start(h, vals, exceptions):
     d = h["date"]
@@ -339,6 +430,8 @@ def save_day_end(h, vals, exceptions):
 CSS = f"""
 <style>
 .stApp {{ background:#fff; color:#111; }}
+[data-testid="stAlert"] p, [data-testid="stAlert"] li, [data-testid="stAlert"] strong,
+[data-testid="stAlert"] a {{ color:#1f2937 !important; }}
 [data-testid="stWidgetLabel"] p, [data-testid="stCaptionContainer"] {{ color:#222 !important; }}
 header[data-testid="stHeader"] {{ background:transparent; }}
 .block-container {{ padding-top:1.2rem; max-width:1150px; }}
@@ -425,18 +518,14 @@ def exceptions_input(prefix):
     st.session_state.setdefault(nkey, 0)
     n = st.session_state[nkey]
     out = []
-    if n:
-        h = st.columns([4, 4, 2])
-        for c, t in zip(h, ["ISSUE / EXCEPTION", "ACTION TAKEN", "ESCALATED TO"]):
-            c.markdown(f'<div class="colh">{t}</div>', unsafe_allow_html=True)
     for i in range(n):
         c = st.columns([4, 4, 2])
         out.append({
-            "issue":     c[0].text_input("Issue",        key=f"{prefix}_ei_{i}", label_visibility="collapsed"),
-            "action":    c[1].text_input("Action taken", key=f"{prefix}_ea_{i}", label_visibility="collapsed"),
-            "escalated": c[2].text_input("Escalated to", key=f"{prefix}_ee_{i}", label_visibility="collapsed"),
+            "issue":     c[0].text_input("Issue", key=f"{prefix}_ei_{i}", placeholder="Issue / exception", label_visibility="collapsed"),
+            "action":    c[1].text_input("Action taken", key=f"{prefix}_ea_{i}", placeholder="Action taken", label_visibility="collapsed"),
+            "escalated": c[2].text_input("Escalated to", key=f"{prefix}_ee_{i}", placeholder="Escalated to", label_visibility="collapsed"),
         })
-    b = st.columns([1.3, 1.6, 6])
+    b = st.columns([1.5, 1.5, 5])
     if b[0].button("＋ Add exception", key=f"{prefix}_add_exc"):
         st.session_state[nkey] += 1
         st.rerun()
@@ -447,16 +536,25 @@ def exceptions_input(prefix):
         st.rerun()
     return out
 
+def dup_notice(kind, d):
+    """Shown right under the date, so it is seen before the form is filled."""
+    names = [tab_name(kind, d)] + ([legacy_name(kind, d)] if legacy_name(kind, d) else [])
+    if any(n in existing_tabs() for n in names):
+        st.warning(f"⚠️ A **{kind}** entry for **{d:%d/%m/%Y}** already exists. "
+                   "Submitting will **replace it completely**, including the exceptions logged from it.")
+
 def submit_gate(prefix, label, name, legacy=None):
     """Renders the submit button; True only when it's OK to write (handles overwrite confirm)."""
     names = [name] + ([legacy] if legacy else [])
-    if any(n in existing_tabs() for n in names):
-        st.warning(f"⚠️ **{name}** already exists. Submitting will **replace it completely**, "
-                   "including the exceptions logged from it.")
     if not st.button(f"✅  Submit {label} Checklist", type="primary",
                      use_container_width=True, key=f"{prefix}_submit"):
         return False
-    if any(tab_exists_fresh(n) for n in names) and st.session_state.get(f"{prefix}_armed") != name:
+    try:
+        exists = any(tab_exists_fresh(n) for n in names)
+    except Exception as ex:
+        st.error(f"Could not reach the Google Sheet. {explain(ex)}")
+        return False
+    if exists and st.session_state.get(f"{prefix}_armed") != name:
         st.session_state[f"{prefix}_armed"] = name
         st.error(f"An entry for **{name}** already exists. Click Submit again to overwrite it.")
         return False
@@ -543,6 +641,7 @@ with tab_ds:
     ds_sup    = c[2].selectbox("Supervisor", SUPERVISORS, key="ds_sup")
     ds_status = c[3].selectbox("Overall status", ["Green", "Amber", "Red"], key="ds_status")
 
+    dup_notice("Day Start", ds_date)
     ds_vals = render_sections("ds", DS_SECTIONS)
     ds_exc  = exceptions_input("ds")
     st.divider()
@@ -557,7 +656,7 @@ with tab_ds:
             clear_caches()
             st.success(f"✅ Saved as **{name}**" + (f" · {n} exception(s) logged" if n else ""))
         except Exception as ex:
-            st.error(f"Error saving: {ex}")
+            st.error(f"Error saving. {explain(ex)}")
 
 # ═══════════════════════════ DAY END ══════════════════════════════════════════
 with tab_de:
@@ -567,6 +666,7 @@ with tab_de:
     de_review = c[2].selectbox("Next-day review by", ["—"] + SUPERVISORS, key="de_review")
     de_status = c[3].selectbox("Overall status", ["Green", "Amber", "Red"], key="de_status")
 
+    dup_notice("Day End", de_date)
     de_vals = render_sections("de", DE_SECTIONS)
     de_exc  = exceptions_input("de")
     st.divider()
@@ -581,7 +681,7 @@ with tab_de:
             clear_caches()
             st.success(f"✅ Saved as **{name}**" + (f" · {n} exception(s) logged" if n else ""))
         except Exception as ex:
-            st.error(f"Error saving: {ex}")
+            st.error(f"Error saving. {explain(ex)}")
 
 # ═══════════════════════════ EXCEPTIONS TRACKER ═══════════════════════════════
 with tab_ex:
@@ -595,7 +695,7 @@ with tab_ex:
         allx = load_exceptions()
     except Exception as ex:
         allx = None
-        st.error(f"Could not load exceptions: {ex}")
+        st.error(f"Could not load exceptions. {explain(ex)}")
 
     if allx is not None:
         today = now_ist().date()
@@ -633,7 +733,35 @@ with tab_ex:
                         st.toast("Resolved — removed from tracker" if status == "Resolved" else "Saved")
                         st.rerun()
                     except Exception as ex:
-                        st.error(f"Could not save: {ex}")
+                        st.error(f"Could not save. {explain(ex)}")
+
+        with st.expander("Import exceptions from older sheets (one-time)"):
+            st.caption("Reads the exceptions from your existing Day Start / Day End tabs. Review the list: "
+                       "untick **Import** for anything that isn't a real exception, tick **Still open** for "
+                       "anything not yet resolved, and fix any wording. Imported items are marked Resolved "
+                       "unless you tick Still open. Ones already in the log are skipped.")
+            if st.button("Scan old sheets", key="imp_scan"):
+                try:
+                    st.session_state["imp_df"] = scan_old_exceptions()
+                except Exception as ex:
+                    st.error(f"Could not scan. {explain(ex)}")
+            imp = st.session_state.get("imp_df")
+            if imp is not None:
+                if imp.empty:
+                    st.success("Nothing new to import.")
+                else:
+                    edited = st.data_editor(imp, hide_index=True, key="imp_editor",
+                                            disabled=["Date", "Source"], num_rows="fixed")
+                    n = int(edited["Import"].sum())
+                    if st.button(f"Import {n} exception(s)", key="imp_go", disabled=n == 0):
+                        try:
+                            done_n = import_exceptions(edited)
+                            st.session_state.pop("imp_df", None)
+                            clear_caches()
+                            st.toast(f"Imported {done_n}")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"Could not import. {explain(ex)}")
 
         if show_resolved:
             done = [e for e in allx if e["status"] == "Resolved"]
@@ -655,6 +783,7 @@ with tab_ex:
 # ═══════════════════════════ VIEW ENTRY ═══════════════════════════════════════
 with tab_view:
     vd = st.date_input("Date to view", value=now_ist().date(), key="view_date", format="DD/MM/YYYY")
+    view_err = False
     try:
         ds_v = load_tab(tab_name("Day Start", vd))
         de_v = load_tab(tab_name("Day End", vd))
@@ -664,8 +793,11 @@ with tab_view:
             de_v = load_tab(legacy_name("Day End", vd))
     except Exception as ex:
         ds_v = de_v = None
-        st.error(f"Could not load: {ex}")
-    if ds_v is None and de_v is None:
+        view_err = True
+        st.error(f"Could not load. {explain(ex)}")
+    if view_err:
+        pass
+    elif ds_v is None and de_v is None:
         st.info(f"No Day Start or Day End entry found for {vd:%d/%m/%Y}.")
     else:
         L, R = st.columns(2)
