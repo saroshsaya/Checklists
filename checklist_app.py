@@ -361,9 +361,19 @@ def save_day_end(h, vals, exceptions):
 CSS = f"""
 <style>
 .stApp {{ background:#fff; color:#111; }}
+/* Colours are set explicitly (text AND background) so nothing disappears in a dark browser theme */
+[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] strong, [data-testid="stMarkdownContainer"] em,
+[data-testid="stCheckbox"] label p, [data-testid="stCheckbox"] label span {{ color:#111 !important; }}
+[data-testid="stWidgetLabel"] p, [data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p {{ color:#222 !important; }}
+[data-testid="stAlertContainer"] {{ background:#F3F4F6 !important; border:1px solid #D1D5DB; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) {{ background:#FFF3CD !important; border-color:#F0C24B; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"])   {{ background:#FDE2E1 !important; border-color:#F5A3A0; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) {{ background:#DDF3E4 !important; border-color:#9ADBB0; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"])    {{ background:#DCEBFA !important; border-color:#A9CCF0; }}
 [data-testid="stAlert"] p, [data-testid="stAlert"] li, [data-testid="stAlert"] strong,
 [data-testid="stAlert"] a {{ color:#1f2937 !important; }}
-[data-testid="stWidgetLabel"] p, [data-testid="stCaptionContainer"] {{ color:#222 !important; }}
 header[data-testid="stHeader"] {{ background:transparent; }}
 .block-container {{ padding-top:1.2rem; max-width:1150px; }}
 div[data-testid="stVerticalBlock"] {{ gap:.45rem; }}
@@ -386,7 +396,8 @@ div[data-testid="stVerticalBlock"] {{ gap:.45rem; }}
 
 div.stButton > button {{ background:{DARK}; color:#fff; border:0; border-radius:4px; font-weight:700; }}
 div.stButton > button:hover {{ background:#000; color:#fff; }}
-div.stButton > button p {{ color:#fff; }}
+div.stButton > button, div.stButton > button p,
+div.stButton > button [data-testid="stMarkdownContainer"] p {{ color:#fff !important; }}
 
 .sec {{ background:{AMBER}; color:#3b2a00; font-weight:800; padding:7px 12px; margin:18px 0 10px;
         border-radius:3px; letter-spacing:.2px; }}
@@ -401,7 +412,7 @@ div.stButton > button p {{ color:#fff; }}
 .exc .meta {{ font-weight:700; color:#111; }}
 .exc div.l {{ margin-top:3px; color:#222; }}
 
-.vt-title {{ font-size:1.15rem; font-weight:800; margin:4px 0 6px; }}
+.vt-title {{ font-size:1.15rem; font-weight:800; margin:4px 0 6px; color:#111; }}
 .vt-sec {{ background:{AMBER}; font-weight:800; padding:5px 10px; margin-top:12px; color:#3b2a00; }}
 .vt table {{ width:100%; border-collapse:collapse; font-size:.86rem; }}
 .vt td {{ border-bottom:1px solid #eee; padding:3px 6px; vertical-align:top; color:#111; }}
@@ -506,6 +517,7 @@ def parse_iso(iso):
 def tab_html(vals):
     """Read-only render of a saved day sheet."""
     out, table = ['<div class="vt">'], []
+    in_table = False
 
     def flush():
         if table:
@@ -516,18 +528,21 @@ def tab_html(vals):
         filled = [c for c in r if c.strip()]
         if not filled:
             flush()
+            in_table = False
             continue
         first = r[0].strip()
         if i == 0:
             out.append(f'<div class="vt-title">{html.escape(first)}</div>')
         elif len(filled) == 1 and re.match(r"^(\d+\.|EXCEPTIONS)", first):
             flush()
+            in_table = False
             out.append(f'<div class="vt-sec">{html.escape(first)}</div>')
-        elif len(filled) == 1:
+        elif len(filled) == 1 and (not in_table or len(first) > 70):
             flush()
             out.append(f'<div class="note">{html.escape(first)}</div>')
         else:
             head = first in ("Check / Field", "Issue / Exception")
+            in_table = in_table or head
             r = list(r)
             while r and not r[-1].strip():
                 r.pop()
