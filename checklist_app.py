@@ -177,6 +177,7 @@ def clear_caches():
     existing_tabs.clear()
     load_tab.clear()
     load_exceptions.clear()
+    load_summary.clear()
 
 
 # ─── Building sheet rows ──────────────────────────────────────────────────────
@@ -427,173 +428,33 @@ def upsert_summary(new_rows):
         ws.resize(rows=len(values) + 200)
     ws.batch_update([{"range": "A1", "values": values}], value_input_option="USER_ENTERED")
 
-def summary_keys():
-    """(date, type) pairs already in the Summary Log - without creating the tab."""
+
+def _time_text(v):
+    """Time cells come back as a fraction of a day (0.54) or as text; show HH:MM."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        mins = round(v * 24 * 60)
+        return f"{mins // 60 % 24:02d}:{mins % 60:02d}"
+    return str(v)
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_summary():
     try:
         ws = get_spreadsheet().worksheet(SUMMARY_TAB)
     except gspread.WorksheetNotFound:
-        return set()
+        return []
     try:
         rows = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
     except TypeError:
         rows = ws.get_all_values()
-    return {(_to_date(r[0]), r[1]) for r in rows[1:] if r and str(r[0]).strip()}
-
-
-# ─── One-time fill of the Summary Log from the older sheets ───────────────────
-OLD_TAB_RE = re.compile(r"^(Day Start|Day End)\((\d{2})-(\d{2})(?:-(\d{4}))?\)")
-
-def _num(s):
-    m = re.match(r"^\s*(\d+)\s*$", str(s))
-    return int(m.group(1)) if m else ""
-
-def _yes_no(s):
-    t = str(s).strip().lower()
-    if re.match(r"(yes|y)\b", t):
-        return "Yes"
-    if re.match(r"(no|n)\b", t):
-        return "No"
-    return ""
-
-def _pest(s):
-    t = str(s).strip().lower()
-    if not t:
-        return ""
-    r = _yes_no(t)
-    if r:
-        return r
-    if re.match(r"(none|nil|nothing|n/?a|-)", t):
-        return "No"
-    return "Yes"                                 # something was described
-
-def _humidifier(s):
-    t = str(s).strip().lower()
-    if not t:
-        return ""
-    if re.search(r"\b(not|stopped|stop|off|no|down|broken)\b", t):
-        return "No"
-    if re.search(r"work|\bon\b|yes|ok|running", t):
-        return "Yes"
-    return ""
-
-def _moves(s):
-    t = str(s).strip()
-    if not t:
-        return ""
-    if re.fullmatch(r"\d+", t):
-        return int(t)
-    if t.lower() in ("none", "nil", "no", "zero", "n/a", "na", "-"):
-        return 0
-    parts = [p for p in re.split(r"[,;/&\s]+|\band\b", t) if p]
-    if parts and all(re.fullmatch(r"[A-Za-z]{1,3}\d{1,3}[A-Za-z]?", p) for p in parts):
-        return len(parts)                        # a list of cubicles like "A3, B1"
-    return ""                                    # can't tell - left blank for you to fill
-
-def _time_of(s):
-    m = re.search(r"(\d{1,2}):(\d{2})(?::\d{2})?\s*([ap]m)?", str(s).lower())
-    if not m:
-        return ""
-    h, mi, ap = int(m.group(1)), int(m.group(2)), m.group(3)
-    if ap == "pm" and h < 12:
-        h += 12
-    if ap == "am" and h == 12:
-        h = 0
-    return f"{h:02d}:{mi:02d}" if h < 24 and mi < 60 else ""
-
-def parse_old_tab(title, vals):
-    """Reads one old-layout day sheet (Field | Entry | Notes | Status | Critical) into a Summary Log row."""
-    m = OLD_TAB_RE.match(title.strip())
-    if not m:
-        return None
-    kind, dd, mm, yyyy = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4) or 2026)
-    try:
-        day = date(yyyy, mm, dd)
-    except ValueError:
-        return None
-    rows = [[str(c).strip() for c in (list(r) + [""] * 6)[:6]] for r in vals]
-    if not any(r[0] == "Check / Field" and r[1].startswith("Entry") for r in rows):
-        return None                              # not an old-layout sheet (the app's own sheets are skipped)
-    body = []
-    for r in rows:
-        if r[0] == "Issue / Exception" and r[1] == "Action Taken":
-            break
-        if r[0] and r[0] != "Check / Field" and not re.match(r"^\d+\.", r[0]) and r[1]:
-            body.append(r)
-    if len(body) < 3:
-        return None                              # empty template that was never filled in
-
-    def get(prefix):
-        for r in rows:
-            if r[0].lower().startswith(prefix):
-                return r[1]
-        return ""
-
-    time_str = ""
-    for r in rows[:8]:
-        for i, c in enumerate(r[:-1]):
-            if c in ("Time checked", "Time completed"):
-                time_str = _time_of(r[i + 1])
-    n_exc = 0
-    for i, r in enumerate(rows):
-        if r[0] == "Issue / Exception" and r[1] == "Action Taken":
-            for x in rows[i + 1:]:
-                if not any(x) or x[0].startswith("Completed by"):
-                    break
-                if x[0].lower() in ("", "none", "n/a", "na", "nil", "-", "no") and not x[1] and not x[2]:
-                    continue
-                n_exc += 1
-    out = {k: "" for k in SUM_COLS}
-    out.update(date=day.isoformat(), type=kind, time=time_str, exc=n_exc)
-    if kind == "Day Start":
-        out.update(assembling=_num(get("orders still in assembling")), packing=_num(get("orders still in packing")),
-                   moves=_moves(get("cubicles still")), rto=_num(get("rto queue")), dto=_num(get("dto queue")),
-                   pest=_pest(get("pest")), ac=_yes_no(get("ac /")), humidifier=_humidifier(get("humidifier")))
-    else:
-        out.update(assembling=_num(get("orders remaining in assembling")), packing=_num(get("orders remaining in packing")),
-                   pickups=_yes_no(get("courier handovers")), moves=_moves(get("cubicles still")),
-                   tablets=_yes_no(get("tablets kept")), scanners=_yes_no(get("scanners kept")),
-                   pest=_pest(get("final pest")))
+    n = len(SUM_HEADER)
+    out = []
+    for r in rows[1:]:
+        r = (list(r) + [""] * n)[:n]
+        d = _to_date(r[0])
+        if d:
+            out.append([d, r[1], _time_text(r[2])] + r[3:])
     return out
 
-def scan_backfill():
-    """Reads every old day sheet in ONE request; returns rows not yet in the Summary Log."""
-    sh = get_spreadsheet()
-    titles = [w.title for w in sh.worksheets() if OLD_TAB_RE.match(w.title.strip())]
-    titles.sort(key=lambda t: len(t.strip()))    # plain names first, so "(14-10) (2)" never beats "(14-10)"
-    parsed = []
-    if titles:
-        ranges = ["'" + t.replace("'", "''") + "'!A1:F90" for t in titles]
-        res = sh.values_batch_get(ranges)
-        for t, vr in zip(titles, res.get("valueRanges", [])):
-            p = parse_old_tab(t, vr.get("values", []))
-            if p:
-                parsed.append(p)
-    have, seen, rows = summary_keys(), set(), []
-    for p in sorted(parsed, key=lambda p: (p["date"], 0 if p["type"] == "Day Start" else 1)):
-        key = (_to_date(p["date"]), p["type"])
-        if key in have or key in seen:
-            continue
-        seen.add(key)
-        rows.append(p)
-    return pd.DataFrame([{"Add": True, **{h: str(r[k]) for h, k in zip(SUM_HEADER, SUM_COLS)}} for r in rows],
-                        columns=["Add"] + SUM_HEADER)
-
-def import_backfill(df):
-    rows = []
-    for _, r in df.iterrows():
-        if bool(r["Add"]):
-            row = {}
-            for h, k in zip(SUM_HEADER, SUM_COLS):
-                v = _clean_cell(r[h])
-                if isinstance(v, str):
-                    v = v.strip()
-                    if re.fullmatch(r"\d+", v) and k not in ("date", "time"):
-                        v = int(v)
-                row[k] = v
-            rows.append(row)
-    if rows:
-        upsert_summary(rows)
-    return len(rows)
 
 # ─── Save entry points ────────────────────────────────────────────────────────
 def log_summary(kind, d, time_str, vals, n_exc):
@@ -861,8 +722,8 @@ if _pw and not st.session_state.get("authed"):
         st.error("Wrong password")
     st.stop()
 
-tab_ds, tab_de, tab_ex, tab_view = st.tabs(
-    ["Day Start", "Day End", "Exceptions Tracker", "View Entry"])
+tab_ds, tab_de, tab_ex, tab_view, tab_sum = st.tabs(
+    ["Day Start", "Day End", "Exceptions Tracker", "View Entry", "Summary"])
 
 # ═══════════════════════════ DAY START ════════════════════════════════════════
 with tab_ds:
@@ -1020,32 +881,28 @@ with tab_view:
                 st.markdown(tab_html(de_v), unsafe_allow_html=True)
 
 
-# ═══════════════════ ONE-TIME: fill Summary Log from older sheets ═════════════
-# Run once, then delete this whole block (from this comment to the end of the file).
-with st.expander("🛠️ One-time: fill the Summary Log from existing sheets"):
-    st.caption("Reads every older Day Start / Day End sheet, shows what it found, and adds the ticked rows to the "
-               "Summary Log. Dates already in the Summary Log are skipped. Fields the old sheets never recorded "
-               "stay blank - you can edit any cell below before importing.")
-    if st.button("1. Scan existing sheets", key="bf_scan"):
-        try:
-            st.session_state["bf_df"] = scan_backfill()
-            st.session_state.pop("bf_done", None)
-        except Exception as ex:
-            st.error(f"Could not read the sheets. {explain(ex)}")
-    if st.session_state.get("bf_done") is not None:
-        st.success(f"✅ Added {st.session_state['bf_done']} row(s) to the Summary Log.")
-    df0 = st.session_state.get("bf_df")
-    if df0 is not None:
-        if df0.empty:
-            st.info("Nothing to add - every existing sheet is already in the Summary Log.")
+# ═══════════════════════════ SUMMARY ══════════════════════════════════════════
+with tab_sum:
+    try:
+        srows = load_summary()
+    except Exception as ex:
+        srows = None
+        st.error(f"Could not load the Summary. {explain(ex)}")
+    if srows is not None:
+        today = now_ist().date()
+        f = st.columns([2, 2, 2, 1], vertical_alignment="bottom")
+        start = f[0].date_input("From", value=today - timedelta(days=13), key="sum_from", format="DD/MM/YYYY")
+        end   = f[1].date_input("To", value=today, key="sum_to", format="DD/MM/YYYY")
+        kind  = f[2].selectbox("Type", ["All", "Day Start", "Day End"], key="sum_type")
+        if f[3].button("↻ Refresh", key="sum_refresh"):
+            clear_caches()
+            st.rerun()
+        shown = [r for r in srows if start <= r[0] <= end and kind in ("All", r[1])]
+        shown.sort(key=lambda r: (r[0], 0 if r[1] == "Day Start" else 1), reverse=True)   # newest first
+        if not shown:
+            st.info("No entries in this range.")
         else:
-            st.write(f"Found **{len(df0)}** entries. Untick any row you do not want.")
-            edited = st.data_editor(df0, hide_index=True, use_container_width=True, key="bf_editor",
-                                    column_config={"Add": st.column_config.CheckboxColumn("Add")})
-            if st.button("2. Add ticked rows to the Summary Log", type="primary", key="bf_go"):
-                try:
-                    st.session_state["bf_done"] = import_backfill(edited)
-                    st.session_state.pop("bf_df", None)
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Could not write. {explain(ex)}")
+            df = pd.DataFrame([[r[0].strftime("%d/%m/%Y")] + [("" if c == "" else c) for c in r[1:]] for r in shown],
+                              columns=SUM_HEADER)
+            st.dataframe(df.astype(str).replace({"nan": ""}), hide_index=True, use_container_width=True)
+            st.caption(f"{len(shown)} entr{'y' if len(shown) == 1 else 'ies'}. Blank = not recorded for that entry.")
