@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
+import altair as alt
 import gspread
 import pandas as pd
 import streamlit as st
@@ -456,6 +457,41 @@ def load_summary():
     return out
 
 
+
+# ─── Summary graphs ───────────────────────────────────────────────────────────
+CHART_SERIES = [("Assembly", 3, "#0A0A7A"), ("Packing", 4, "#00CC66"), ("Cancelled orders", 6, "#E53935"),
+                ("Moves", 7, "#FF9800"), ("Checking", 8, "#8E24AA"), ("RTOs", 9, "#6FA8DC"),
+                ("DTOs", 10, "#8D6E63"), ("Exceptions", 16, "#2B2B2B")]
+
+def summary_chart(rows, kind):
+    """One line chart for one entry type; click a legend name to hide / show that line."""
+    recs = []
+    for r in rows:
+        if r[1] != kind:
+            continue
+        for name, idx, _ in CHART_SERIES:
+            v = r[idx]
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                recs.append({"Date": pd.Timestamp(r[0]), "Metric": name, "Count": v})
+    if not recs:
+        return None
+    pick = alt.selection_point(fields=["Metric"], bind="legend")
+    base = alt.Chart(pd.DataFrame(recs)).encode(
+        x=alt.X("Date:T", title=None, axis=alt.Axis(format="%d %b", labelColor="#111", labelAngle=-45)),
+        y=alt.Y("Count:Q", title=None, scale=alt.Scale(domainMin=0), axis=alt.Axis(labelColor="#111")),
+        color=alt.Color("Metric:N", sort=[n for n, _, _ in CHART_SERIES],
+                        scale=alt.Scale(domain=[n for n, _, _ in CHART_SERIES],
+                                        range=[c for _, _, c in CHART_SERIES]),
+                        legend=alt.Legend(title=None, labelColor="#111", labelFontSize=13, symbolType="stroke")),
+        opacity=alt.condition(pick, alt.value(1), alt.value(0.12)),
+        tooltip=[alt.Tooltip("Date:T", format="%d %b %Y"), "Metric:N", "Count:Q"])
+    lines = base.mark_line(strokeWidth=2.5).transform_filter(pick)      # un-picked lines drop out,
+    dots  = base.mark_point(size=60, filled=True).transform_filter(pick)  # so the axis re-scales
+    return ((lines + dots).add_params(pick)
+            .properties(height=320, background="white")
+            .configure_view(stroke=None)
+            .configure_axis(gridColor="#e3e3e3", domainColor="#999", tickColor="#999"))
+
 # ─── Save entry points ────────────────────────────────────────────────────────
 def log_summary(kind, d, time_str, vals, n_exc):
     """Adds/replaces this entry's Summary Log row. Returns a warning text if it failed (the day sheet is already saved)."""
@@ -899,6 +935,16 @@ with tab_sum:
             st.rerun()
         shown = [r for r in srows if start <= r[0] <= end and kind in ("All", r[1])]
         shown.sort(key=lambda r: (r[0], 0 if r[1] == "Day Start" else 1), reverse=True)   # newest first
+        in_range = [r for r in srows if start <= r[0] <= end]
+        for k in ("Day Start", "Day End"):
+            st.markdown(f'<div class="sec">{k.upper()} — TREND</div>', unsafe_allow_html=True)
+            ch = summary_chart(in_range, k)
+            if ch is None:
+                st.info(f"No {k} numbers in this range.")
+            else:
+                st.altair_chart(ch, use_container_width=True, theme=None)
+        st.caption("Click a name in the legend to focus on that line (Shift + click to pick several, double-click the graph to show all again). Gaps mean nothing was recorded that day.")
+        st.markdown('<div class="sec">ALL ENTRIES</div>', unsafe_allow_html=True)
         if not shown:
             st.info("No entries in this range.")
         else:
