@@ -1,4 +1,5 @@
 import hmac
+from contextlib import nullcontext
 import html
 import re
 import uuid
@@ -57,7 +58,9 @@ DS_SECTIONS = [
     ]),
     ("2. STOCK & STORAGE READINESS", [
         I("Stock left in temporary / unusual locations", "unusual"),
-        I("Stock on floor that should be shelved",       "floor"),
+        I("Stock kept on floor after inventory checking", "floor_checked", "num"),
+        I("Inventory pending physical check",           "inv_pending", "num"),
+        I("Critical items out of stock (names in Notes)", "crit_oos",  "num", True),
         I("Moves pending (move list entries)",          "moves",     "num", True),
         I("Cancelled orders pending",                   "cancelled", "num", True),
         I("Open stock merged to base",                  "open_merged"),
@@ -67,7 +70,7 @@ DS_SECTIONS = [
         I("Orders still in ASSEMBLING", "assembling",    "num", True),
         I("Orders still in PACKING",    "packing",       "num", True),
         I("RTO queue requiring action", "rto",           "num"),
-        I("DTO queue requiring action", "dto",           "num"),
+        I("DTO queue requiring action", "dto",           "num", True),
         I("Notes pending",              "notes_pending", "num"),
     ]),
     ("4. EQUIPMENT & PACKING READINESS", [
@@ -81,7 +84,6 @@ DS_SECTIONS = [
         I("Bubble wrap / protective material available", "bubble_wrap", crit=True),
         I("Tape available",                              "tape"),
         I("Packing station ready",                       "packing_station"),
-        I("Any equipment issue / note",                  "eq_issue", "text", True, "None / describe"),
         I("Cameras working",                             "cameras"),
     ]),
 ]
@@ -92,19 +94,21 @@ DE_SECTIONS = [
         I("Orders remaining in PACKING",            "packing",    "num", True),
         I("Cancelled orders pending",               "cancelled",  "num", True),
         I("Courier handovers completed / recorded", "courier"),
+        I("Samples sent today (qty)",               "samples",    "num"),
     ]),
-    ("2. MOVES / CHECKING", [
-        I("Moves pending (move list entries)", "moves",    "num", True),
-        I("Checking pending",                  "checking", "num"),
+    ("2. MOVES / CHECKING / INVENTORY", [
+        I("Moves pending (move list entries)",             "moves",         "num", True),
+        I("Checking pending",                              "checking",      "num"),
+        I("Inventory pending physical check",              "inv_pending",   "num"),
+        I("Stock kept on floor after inventory checking",  "floor_checked", "num"),
     ]),
     ("3. RTO / DTO", [
         I("RTOs left",                           "rto_left", "num"),
-        I("DTOs left",                           "dto_left", "num"),
+        I("DTOs left",                           "dto_left", "num", True),
         I("Returned stock requiring restocking", "restocking"),
     ]),
     ("4. WAREHOUSE RESET  ★ CRITICAL (Close Clean)", [
         I("Loose stock returned to appropriate location", "loose_stock",       crit=True),
-        I("LT → ST movement completed",                   "lt_st",             crit=True),
         I("Packing materials replenished",                "packing_materials", crit=True),
         I("Picking / assembly area reset",                "assembly_reset",    crit=True),
         I("Packing tables cleared",                       "packing_tables",    crit=True),
@@ -123,6 +127,13 @@ DE_SECTIONS = [
         I("Pest / insect / rodent activity observed",    "pest", "ny"),
     ]),
 ]
+
+
+def crit_labels(sections):
+    return {it["label"] for _, items in sections for it in items if it["crit"]}
+
+CRIT_DS, CRIT_DE = crit_labels(DS_SECTIONS), crit_labels(DE_SECTIONS)
+CRIT_ALL = CRIT_DS | CRIT_DE
 
 
 # ─── Google Sheets plumbing ───────────────────────────────────────────────────
@@ -187,11 +198,11 @@ BLANK = [""]
 def sections_to_rows(sections, vals):
     rows = []
     for title, items in sections:
-        rows.append([title, "", "", ""])
-        rows.append(["Check / Field", "Critical?", "Entry", "Notes / Details"])
+        rows.append([title, "", ""])
+        rows.append(["Check / Field", "Entry", "Notes / Details"])
         for it in items:
             v, note = vals[it["key"]]
-            rows.append([it["label"], "CRITICAL" if it["crit"] else "", str(v), note])
+            rows.append([it["label"], str(v), note])
         rows.append(BLANK)
     return rows
 
@@ -206,7 +217,7 @@ def exceptions_to_rows(title, exceptions):
     rows.append(BLANK)
     return rows
 
-def format_tab(sh, ws, rows):
+def format_tab(sh, ws, rows, crit=()):
     """Bold headers / amber section bands / red CRITICAL - cosmetic only."""
     sid, reqs = ws.id, []
 
@@ -229,16 +240,17 @@ def format_tab(sh, ws, rows):
         elif first in ("Check / Field", "Issue / Exception"):
             cell_fmt(i, 0, 6, {"textFormat": {"bold": True}, "backgroundColor": grey},
                      "userEnteredFormat(textFormat,backgroundColor)")
-        elif len(r) > 1 and r[1] == "CRITICAL":
-            cell_fmt(i, 1, 2, {"textFormat": {"bold": True, "foregroundColor": {"red": 0.9, "green": 0.1, "blue": 0.1}}},
-                     "userEnteredFormat.textFormat")
-    for col, px in enumerate([380, 90, 150, 300, 110, 150]):
+        elif first in crit:                      # critical row -> light red band, dark red bold text
+            cell_fmt(i, 0, 3, {"textFormat": {"bold": True, "foregroundColor": {"red": 0.72, "green": 0.11, "blue": 0.11}},
+                               "backgroundColor": {"red": 1.0, "green": 0.88, "blue": 0.88}},
+                     "userEnteredFormat(textFormat,backgroundColor)")
+    for col, px in enumerate([380, 150, 300, 110, 110, 150]):
         reqs.append({"updateDimensionProperties": {
             "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": col, "endIndex": col + 1},
             "properties": {"pixelSize": px}, "fields": "pixelSize"}})
     sh.batch_update({"requests": reqs})
 
-def write_tab(name, rows, legacy=None):
+def write_tab(name, rows, legacy=None, crit=()):
     sh = get_spreadsheet()
     width = max(6, max(len(r) for r in rows))
     try:
@@ -249,7 +261,7 @@ def write_tab(name, rows, legacy=None):
         ws = sh.add_worksheet(title=name, rows=len(rows) + 5, cols=width)
     ws.batch_update([{"range": "A1", "values": rows}], value_input_option="RAW")
     try:
-        format_tab(sh, ws, rows)
+        format_tab(sh, ws, rows, crit)
     except Exception:
         pass                                     # formatting is cosmetic; never fail a save over it
     if legacy and legacy != name:                # replaced an old year-less tab -> drop it
@@ -316,11 +328,24 @@ def update_exception(exc_id, fby, fdate, status):
 # ─── Summary Log (one row per Day Start / Day End) ────────────────────────────
 SUMMARY_TAB = "Summary Log"
 SUM_HEADER  = ["Date", "Type", "Time", "Orders in assembly", "Orders in packing", "All pickups done",
-               "Cancelled orders pending", "Moves pending", "Items left in checking", "RTOs left",
-               "DTOs left", "Tablets on charge", "Scanners on charge", "Pest seen", "AC working",
-               "Humidifier working", "Exception count"]
-SUM_COLS    = ["date", "type", "time", "assembling", "packing", "pickups", "cancelled", "moves",
-               "checking", "rto", "dto", "tablets", "scanners", "pest", "ac", "humidifier", "exc"]
+               "Cancelled orders pending", "Moves pending", "Items left in checking",
+               "Inventory pending check", "Samples sent", "Critical items out of stock",
+               "Stock on floor after checking", "RTOs left", "DTOs left", "Tablets on charge",
+               "Scanners on charge", "Pest seen", "AC working", "Humidifier working", "Exception count"]
+SUM_COLS    = ["date", "type", "time", "assembling", "packing", "pickups", "cancelled", "moves", "checking",
+               "inventory", "samples", "critoos", "floor", "rto", "dto", "tablets", "scanners", "pest",
+               "ac", "humidifier", "exc"]
+
+def _remap(rows):
+    """Aligns sheet rows to SUM_HEADER by column NAME, so older sheets with fewer/other columns still read right."""
+    if not rows:
+        return []
+    pos = {str(h).strip(): i for i, h in enumerate(rows[0])}
+    out = []
+    for r in rows[1:]:
+        if any(str(c).strip() for c in r):
+            out.append([r[pos[h]] if h in pos and pos[h] < len(r) else "" for h in SUM_HEADER])
+    return out
 
 def _val(vals, key):
     return vals[key][0] if key in vals else ""
@@ -331,12 +356,13 @@ def summary_row(kind, d, time_str, vals, n_exc):
     row.update(date=d.isoformat(), type=kind, time=time_str, exc=n_exc,
                assembling=_val(vals, "assembling"), packing=_val(vals, "packing"),
                cancelled=_val(vals, "cancelled"), moves=_val(vals, "moves"),
+               inventory=_val(vals, "inv_pending"), floor=_val(vals, "floor_checked"),
                pest=_val(vals, "pest"))
     if kind == "Day Start":
-        row.update(rto=_val(vals, "rto"), dto=_val(vals, "dto"),
+        row.update(rto=_val(vals, "rto"), dto=_val(vals, "dto"), critoos=_val(vals, "crit_oos"),
                    ac=_val(vals, "ac"), humidifier=_val(vals, "humidifier"))
     else:
-        row.update(pickups=_val(vals, "courier"), checking=_val(vals, "checking"),
+        row.update(pickups=_val(vals, "courier"), checking=_val(vals, "checking"), samples=_val(vals, "samples"),
                    rto=_val(vals, "rto_left"), dto=_val(vals, "dto_left"),
                    tablets=_val(vals, "tablets"), scanners=_val(vals, "scanner"))
     return row
@@ -411,7 +437,15 @@ def upsert_summary(new_rows):
     except TypeError:
         old = ws.get_all_values()
     n = len(SUM_HEADER)
-    body = [(list(r) + [""] * n)[:n] for r in old[1:] if any(str(c).strip() for c in r)]
+    old_header = [str(c).strip() for c in old[0]] if old else []
+    body = _remap(old)
+    if ws.col_count < n:
+        ws.resize(cols=n)
+    if old_header[:n] != SUM_HEADER:             # sheet from an earlier version: re-style the new header
+        try:
+            format_summary(sh, ws)
+        except Exception:
+            pass
     fresh = [[_clean_cell(r[k]) for k in SUM_COLS] for r in new_rows]
     replaced = {(_to_date(r[0]), r[1]) for r in fresh}
     kept = [r for r in body if (_to_date(r[0]), r[1]) not in replaced]
@@ -447,10 +481,8 @@ def load_summary():
         rows = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
     except TypeError:
         rows = ws.get_all_values()
-    n = len(SUM_HEADER)
     out = []
-    for r in rows[1:]:
-        r = (list(r) + [""] * n)[:n]
+    for r in _remap(rows):
         d = _to_date(r[0])
         if d:
             out.append([d, r[1], _time_text(r[2])] + r[3:])
@@ -459,9 +491,12 @@ def load_summary():
 
 
 # ─── Summary graphs ───────────────────────────────────────────────────────────
-CHART_SERIES = [("Assembly", 3, "#0A0A7A"), ("Packing", 4, "#00CC66"), ("Cancelled orders", 6, "#E53935"),
-                ("Moves", 7, "#FF9800"), ("Checking", 8, "#8E24AA"), ("RTOs", 9, "#6FA8DC"),
-                ("DTOs", 10, "#8D6E63"), ("Exceptions", 16, "#2B2B2B")]
+CHART_SERIES = [("Assembly", "assembling", "#0A0A7A"), ("Packing", "packing", "#00CC66"),
+                ("Cancelled orders", "cancelled", "#E53935"), ("Moves", "moves", "#FF9800"),
+                ("Checking", "checking", "#8E24AA"), ("Inventory pending", "inventory", "#00838F"),
+                ("Samples sent", "samples", "#9E9D24"), ("Critical out of stock", "critoos", "#B71C1C"),
+                ("Floor stock", "floor", "#EC407A"), ("RTOs", "rto", "#6FA8DC"),
+                ("DTOs", "dto", "#8D6E63"), ("Exceptions", "exc", "#2B2B2B")]
 
 def summary_chart(rows, kind):
     """One line chart for one entry type; click a legend name to hide / show that line."""
@@ -469,8 +504,8 @@ def summary_chart(rows, kind):
     for r in rows:
         if r[1] != kind:
             continue
-        for name, idx, _ in CHART_SERIES:
-            v = r[idx]
+        for name, key, _ in CHART_SERIES:
+            v = r[SUM_COLS.index(key)]
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 recs.append({"Date": pd.Timestamp(r[0]), "Metric": name, "Count": v})
     if not recs:
@@ -515,7 +550,7 @@ def save_day_start(h, vals, exceptions):
     rows += sections_to_rows(DS_SECTIONS, vals)
     rows += exceptions_to_rows("EXCEPTIONS / ISSUES LOG", exceptions)
     rows.append(["Completed by (signature/name)", h["by"], "", "Supervisor verification"])
-    write_tab(name, rows, legacy_name("Day Start", d))
+    write_tab(name, rows, legacy_name("Day Start", d), CRIT_DS)
     n = sync_exceptions(d.isoformat(), "Day Start", exceptions)
     return name, n, log_summary("Day Start", d, h["time"], vals, n)
 
@@ -533,7 +568,7 @@ def save_day_end(h, vals, exceptions):
     rows += sections_to_rows(DE_SECTIONS, vals)
     rows += exceptions_to_rows("EXCEPTIONS / ISSUES LOG (Hand-over for next day)", exceptions)
     rows.append(["Completed by (Closing Supervisor)", h["by"], "", "Next-day review by", "", h["review"]])
-    write_tab(name, rows, legacy_name("Day End", d))
+    write_tab(name, rows, legacy_name("Day End", d), CRIT_DE)
     n = sync_exceptions(d.isoformat(), "Day End", exceptions)
     return name, n, log_summary("Day End", d, h["time"], vals, n)
 
@@ -584,9 +619,10 @@ div.stButton > button [data-testid="stMarkdownContainer"] p {{ color:#fff !impor
         border-radius:3px; letter-spacing:.2px; }}
 .colh {{ font-size:.7rem; color:#6b7280; font-weight:700; letter-spacing:.6px; }}
 .lbl {{ font-weight:500; color:#111; }}
-.hl {{ background:#FFFF00; padding:1px 4px; font-weight:600; color:#111; }}
-.crit {{ background:{RED}; color:#fff; font-size:.6rem; font-weight:800; padding:1px 6px;
-         border-radius:3px; margin-left:6px; vertical-align:middle; }}
+.hl {{ font-weight:700; color:#B71C1C; }}
+/* critical rows: light red band with a red edge (the row container carries a key starting with crit_) */
+[class*="st-key-crit_"] {{ background:#FDE7E7; border-left:5px solid {RED}; border-radius:4px;
+                           padding:4px 8px; margin:2px 0; }}
 
 .exc {{ border-left:6px solid #999; padding:4px 10px 6px; margin-bottom:10px; }}
 .exc .chip {{ color:#fff; font-size:.7rem; font-weight:800; padding:2px 9px; border-radius:3px; margin-right:6px; }}
@@ -599,38 +635,43 @@ div.stButton > button [data-testid="stMarkdownContainer"] p {{ color:#fff !impor
 .vt td {{ border-bottom:1px solid #eee; padding:3px 6px; vertical-align:top; color:#111; }}
 .vt tr.h td {{ background:#EBEBEB; font-weight:700; }}
 .vt td.critc {{ color:{RED}; font-weight:800; }}
+.vt tr.crit td {{ background:#FDE7E7; color:#B71C1C; font-weight:700; }}
 .vt .note {{ color:#444; font-size:.85rem; margin:3px 0; }}
 </style>
 """
 
 
 # ─── UI helpers ───────────────────────────────────────────────────────────────
+def row_box(key):
+    """A keyed container (lets the CSS paint critical rows red); falls back to a plain one on older Streamlit."""
+    try:
+        return st.container(key=key)
+    except TypeError:
+        return nullcontext()
+
 def render_sections(prefix, sections):
-    """One row per check: label | entry | notes. Returns {key: (value, note)}."""
+    """One row per check: label | entry | notes. Critical rows are painted red. Returns {key: (value, note)}."""
     out = {}
     for title, items in sections:
         st.markdown(f'<div class="sec">{html.escape(title)}</div>', unsafe_allow_html=True)
         for it in items:
-            c1, c2, c3 = st.columns([4, 2, 4], vertical_alignment="center")
-            lab = html.escape(it["label"])
-            if it["crit"]:
-                c1.markdown(f'<span class="hl">{lab}</span><span class="crit">CRITICAL</span>',
-                            unsafe_allow_html=True)
-            else:
-                c1.markdown(f'<span class="lbl">{lab}</span>', unsafe_allow_html=True)
-            k = f"{prefix}_{it['key']}"
-            with c2:
-                if it["kind"] in ("yn", "ny"):          # "ny" = a problem check, so it starts on No
-                    v = st.selectbox(it["label"], ["Yes", "No"] if it["kind"] == "yn" else ["No", "Yes"],
-                                     key=k, label_visibility="collapsed")
-                elif it["kind"] == "num":
-                    v = int(st.number_input(it["label"], min_value=0, step=1, key=k,
-                                            label_visibility="collapsed"))
-                else:
-                    v = st.text_input(it["label"], key=k, placeholder=it["ph"],
-                                      label_visibility="collapsed")
-            n = c3.text_input(it["label"] + " notes", key=k + "_n", placeholder="Notes",
-                              label_visibility="collapsed")
+            with (row_box(f"crit_{prefix}_{it['key']}") if it["crit"] else nullcontext()):
+                c1, c2, c3 = st.columns([4, 2, 4], vertical_alignment="center")
+                lab = html.escape(it["label"])
+                c1.markdown(f'<span class="{"hl" if it["crit"] else "lbl"}">{lab}</span>', unsafe_allow_html=True)
+                k = f"{prefix}_{it['key']}"
+                with c2:
+                    if it["kind"] in ("yn", "ny"):      # "ny" = a problem check, so it starts on No
+                        v = st.selectbox(it["label"], ["Yes", "No"] if it["kind"] == "yn" else ["No", "Yes"],
+                                         key=k, label_visibility="collapsed")
+                    elif it["kind"] == "num":
+                        v = int(st.number_input(it["label"], min_value=0, step=1, key=k,
+                                                label_visibility="collapsed"))
+                    else:
+                        v = st.text_input(it["label"], key=k, placeholder=it["ph"],
+                                          label_visibility="collapsed")
+                n = c3.text_input(it["label"] + " notes", key=k + "_n", placeholder="Notes",
+                                  label_visibility="collapsed")
             out[it["key"]] = (v, n)
     return out
 
@@ -700,6 +741,8 @@ def tab_html(vals):
     """Read-only render of a saved day sheet."""
     out, table = ['<div class="vt">'], []
     in_table = False
+    new_layout = any(r and r[0] == "Check / Field" and len(r) > 1 and r[1] == "Entry"
+                     and not (list(r) + [""] * 5)[3].strip() for r in vals)   # 3-column sheets: critical = red row
 
     def flush():
         if table:
@@ -730,7 +773,8 @@ def tab_html(vals):
                 r.pop()
             cells = "".join(
                 f'<td class="{"critc" if c == "CRITICAL" else ""}">{html.escape(c)}</td>' for c in r)
-            table.append(f'<tr class="{"h" if head else ""}">{cells}</tr>')
+            cls = "h" if head else ("crit" if new_layout and first in CRIT_ALL else "")
+            table.append(f'<tr class="{cls}">{cells}</tr>')
     flush()
     out.append("</div>")
     return "".join(out)
