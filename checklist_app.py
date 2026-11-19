@@ -101,10 +101,10 @@ DE_SECTIONS = [
         I("Inventory pending physical check",              "inv_pending",   "num", True),
         I("Stock kept on floor after inventory checking",  "floor_checked", "num"),
     ]),
-    ("3. RTO / DTO", [
+    ("3. RTO / DTO / EXCESS LIST", [
         I("RTOs left",                           "rto_left", "num"),
         I("DTOs left",                           "dto_left", "num", True),
-        I("Returned stock requiring restocking", "restocking"),
+        I("Excess List items pending",          "excess_list", "num"),
     ]),
     ("4. WAREHOUSE RESET  ★ CRITICAL (Close Clean)", [
         I("Loose stock returned to appropriate location", "loose_stock",       crit=True),
