@@ -49,17 +49,16 @@ def I(label, key, kind="yn", crit=False, ph=""):
 
 DS_SECTIONS = [
     ("1. ENVIRONMENT & WAREHOUSE READINESS", [
-        I("AC / climate control working",             "ac"),
-        I("Humidifier / dehumidifier working",        "humidifier"),
+        I("AC / climate control working",             "ac", "ynn"),
+        I("Humidifier / dehumidifier working",        "humidifier", "ynn"),
         I("Pest / insect / rodent activity observed", "pest", "ny"),
         I("Aisles / walking paths clear",             "aisles"),
         I("Shelves / work areas tidy",                "shelves"),
         I("Packing tables clean",                     "packing_tables"),
     ]),
     ("2. STOCK & STORAGE READINESS", [
-        I("Stock left in temporary / unusual locations", "unusual"),
         I("Stock kept on floor after inventory checking", "floor_checked", "num"),
-        I("Inventory pending physical check",           "inv_pending", "num"),
+        I("Inventory pending physical check",           "inv_pending", "num", True),
         I("Critical items out of stock (names in Notes)", "crit_oos",  "num", True),
         I("Moves pending (move list entries)",          "moves",     "num", True),
         I("Cancelled orders pending",                   "cancelled", "num", True),
@@ -99,7 +98,7 @@ DE_SECTIONS = [
     ("2. MOVES / CHECKING / INVENTORY", [
         I("Moves pending (move list entries)",             "moves",         "num", True),
         I("Checking pending",                              "checking",      "num"),
-        I("Inventory pending physical check",              "inv_pending",   "num"),
+        I("Inventory pending physical check",              "inv_pending",   "num", True),
         I("Stock kept on floor after inventory checking",  "floor_checked", "num"),
     ]),
     ("3. RTO / DTO", [
@@ -122,8 +121,8 @@ DE_SECTIONS = [
         I("Camera working",                   "cameras"),
     ]),
     ("6. ENVIRONMENT", [
-        I("AC / climate control set for overnight",      "ac"),
-        I("Humidifier / dehumidifier set appropriately", "humidifier"),
+        I("AC / climate control set for overnight",      "ac", "ynn"),
+        I("Humidifier / dehumidifier set appropriately", "humidifier", "ynn"),
         I("Pest / insect / rodent activity observed",    "pest", "ny"),
     ]),
 ]
@@ -661,9 +660,9 @@ def render_sections(prefix, sections):
                 c1.markdown(f'<span class="{"hl" if it["crit"] else "lbl"}">{lab}</span>', unsafe_allow_html=True)
                 k = f"{prefix}_{it['key']}"
                 with c2:
-                    if it["kind"] in ("yn", "ny"):      # "ny" = a problem check, so it starts on No
-                        v = st.selectbox(it["label"], ["Yes", "No"] if it["kind"] == "yn" else ["No", "Yes"],
-                                         key=k, label_visibility="collapsed")
+                    if it["kind"] in ("yn", "ny", "ynn"):   # "ny" = a problem check, starts on No
+                        opts = {"yn": ["Yes", "No"], "ny": ["No", "Yes"], "ynn": ["Yes", "No", "Not needed"]}
+                        v = st.selectbox(it["label"], opts[it["kind"]], key=k, label_visibility="collapsed")
                     elif it["kind"] == "num":
                         v = int(st.number_input(it["label"], min_value=0, step=1, key=k,
                                                 label_visibility="collapsed"))
