@@ -618,6 +618,10 @@ div.stButton > button [data-testid="stMarkdownContainer"] p {{ color:#fff !impor
         border-radius:3px; letter-spacing:.2px; }}
 .colh {{ font-size:.7rem; color:#6b7280; font-weight:700; letter-spacing:.6px; }}
 .lbl {{ font-weight:500; color:#111; }}
+/* fixed (read-only) fields such as Supervisor: clearly readable on any theme */
+div:has(> input:disabled), input:disabled {{
+    background:#F0F2F6 !important; color:#111 !important; -webkit-text-fill-color:#111 !important;
+    opacity:1 !important; font-weight:600; }}
 .hl {{ font-weight:700; color:#B71C1C; }}
 /* critical rows: light red band with a red edge (the row container carries a key starting with crit_) */
 [class*="st-key-crit_"] {{ background:#FDE7E7; border-left:5px solid {RED}; border-radius:4px;
@@ -809,7 +813,7 @@ with tab_ds:
     c = st.columns(4)
     ds_date   = c[0].date_input("Date", value=now_ist().date(), key="ds_date", format="DD/MM/YYYY")
     ds_by     = c[1].selectbox("Completed by", SUPERVISORS, key="ds_by")
-    ds_sup    = c[2].selectbox("Supervisor", SUPERVISORS, key="ds_sup")
+    ds_sup    = c[2].text_input("Supervisor", value="Sarosh", disabled=True, key="ds_sup")   # fixed, not a dropdown
     ds_status = c[3].selectbox("Overall status", ["Green", "Amber", "Red"], key="ds_status")
 
     dup_notice("Day Start", ds_date)
